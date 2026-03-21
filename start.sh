@@ -1,27 +1,18 @@
-FROM python:3.11-slim
+#!/bin/bash
 
-WORKDIR /app
+echo "Starting Cloudflare WARP..."
+# Start the WARP background service manually
+warp-svc &
+# Give it 5 seconds to boot up
+sleep 5
 
-# 1. Install necessary system tools
-RUN apt-get update && apt-get install -y \
-    gcc python3-dev libglib2.0-0 \
-    curl gnupg \
-    && rm -rf /var/lib/apt/lists/*
+# Register, set proxy mode, and connect
+warp-cli --accept-tos registration new
+warp-cli --accept-tos mode proxy
+warp-cli --accept-tos connect
 
-# 2. Install Cloudflare WARP (Specifically for Debian Bookworm)
-RUN curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg && \
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ bookworm main" | tee /etc/apt/sources.list.d/cloudflare-client.list && \
-    apt-get update && apt-get install -y cloudflare-warp && \
-    rm -rf /var/lib/apt/lists/*
+# Wait 2 seconds for the connection to establish
+sleep 2
 
-COPY . .
-
-# 3. Install Python requirements
-RUN pip install --no-cache-dir -U pip
-RUN pip install --no-cache-dir -r requirements.txt
-
-# 4. Make the startup script executable
-RUN chmod +x start.sh
-
-# 5. Run the startup script!
-CMD ["./start.sh"]
+echo "WARP Connected! Starting Telegram Bot..."
+python bot.py
