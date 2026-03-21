@@ -1,0 +1,8 @@
+pyrogram==2.0.106
+pyaes
+mega.py
+aiofiles
+psutil
+python-dotenv
+requests
+opencv-python-headless
