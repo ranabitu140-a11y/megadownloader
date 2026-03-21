@@ -4,6 +4,7 @@ mega.py
 aiofiles
 psutil
 python-dotenv
-requests
 opencv-python-headless
 tgcrypto
+requests[socks]
+PySocks
