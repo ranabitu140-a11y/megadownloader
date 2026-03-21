@@ -1,25 +1,27 @@
 FROM python:3.11-slim
 
-# Set the working directory inside the container
 WORKDIR /app
 
-# Install system dependencies needed for your specific bot:
-# 1. gcc & python3-dev: Required to compile tgcrypto for lightning-fast uploads
-# 2. libglib2.0-0: Required by OpenCV to process video thumbnails
+# 1. Install necessary system tools
 RUN apt-get update && apt-get install -y \
-    gcc \
-    python3-dev \
-    libglib2.0-0 \
+    gcc python3-dev libglib2.0-0 \
+    curl gnupg \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy all your bot files (bot.py, requirements.txt, etc.) into the container
+# 2. Install Cloudflare WARP (Specifically for Debian Bookworm)
+RUN curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ bookworm main" | tee /etc/apt/sources.list.d/cloudflare-client.list && \
+    apt-get update && apt-get install -y cloudflare-warp && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY . .
 
-# Upgrade pip to the latest version
+# 3. Install Python requirements
 RUN pip install --no-cache-dir -U pip
-
-# Install all the plugins from your requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Command to start your high-performance bot
-CMD ["python", "bot.py"]
+# 4. Make the startup script executable
+RUN chmod +x start.sh
+
+# 5. Run the startup script!
+CMD ["./start.sh"]
