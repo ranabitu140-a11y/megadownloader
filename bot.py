@@ -18,6 +18,7 @@ import asyncio
 import logging
 from pathlib import Path
 from typing import Optional
+import subprocess
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -57,6 +58,10 @@ SPLIT_READ_BUF = 8 * 1024 * 1024          # 8 MB I/O buffer
 PROGRESS_EDIT_INTERVAL = 3                 # seconds between edits
 MAX_CONCURRENT_USERS = 5
 
+# ── WARP Proxy (set in .env to enable) ──
+WARP_PROXY = os.environ.get("WARP_PROXY", "").strip()  # e.g. socks5h://127.0.0.1:40000
+WARP_ENABLED = bool(WARP_PROXY)
+
 MEGA_LINK_RE = re.compile(
     r"https?://mega\.nz/(?:file|folder|#|#!|#F!)[^\s]+"
 )
@@ -82,6 +87,44 @@ global_semaphore = asyncio.Semaphore(MAX_CONCURRENT_USERS)
 
 # Conversation state: user_id → (msg, link, chat_id, folder_id, file_infos)
 folder_pending: dict[int, tuple] = {}
+
+
+class BandwidthLimitError(Exception):
+    """Raised when Mega returns 509 Bandwidth Limit Exceeded."""
+    pass
+
+
+def _get_proxied_session() -> requests.Session:
+    """Return a requests Session with WARP SOCKS5 proxy if configured."""
+    s = requests.Session()
+    if WARP_ENABLED:
+        s.proxies = {"http": WARP_PROXY, "https": WARP_PROXY}
+    return s
+
+
+def _rotate_warp_ip() -> bool:
+    """
+    Disconnect and reconnect Cloudflare WARP to get a fresh IP.
+    Returns True if successful.
+    """
+    if not WARP_ENABLED:
+        return False
+    try:
+        subprocess.run(["warp-cli", "disconnect"], timeout=10,
+                       capture_output=True, check=False)
+        import time as _time
+        _time.sleep(2)
+        result = subprocess.run(["warp-cli", "connect"], timeout=15,
+                                capture_output=True, check=False)
+        _time.sleep(3)  # wait for connection to establish
+        log.info("WARP IP rotated (exit code: %d)", result.returncode)
+        return result.returncode == 0
+    except FileNotFoundError:
+        log.warning("warp-cli not found, cannot rotate IP")
+        return False
+    except Exception as exc:
+        log.warning("WARP rotation failed: %s", exc)
+        return False
 
 
 # ──────────────────────────────────────────────────────────────
@@ -183,7 +226,8 @@ def _mega_get_folder_info_sync(url: str) -> tuple[str, list[dict]]:
     data = None
     for attempt in range(1, 4):
         try:
-            resp = requests.post(
+            sess = _get_proxied_session()
+            resp = sess.post(
                 "https://g.api.mega.co.nz/cs",
                 params={"id": 0, "n": folder_id},
                 json=[{"a": "f", "c": 1, "r": 1}],
@@ -265,17 +309,22 @@ def _mega_download_one_file_sync(
     k        = file_info["aes_key"]
     iv       = file_info["iv"]
 
-    # Get download URL
-    dl_resp = requests.post(
+    # Get download URL (through WARP proxy if enabled)
+    sess = _get_proxied_session()
+    dl_resp = sess.post(
         "https://g.api.mega.co.nz/cs",
         params={"id": 1, "n": folder_id},
         json=[{"a": "g", "g": 1, "n": handle}],
         timeout=(10, 120),
     )
+    if dl_resp.status_code == 509:
+        raise BandwidthLimitError(f"Mega bandwidth limit exceeded for {filename}")
     dl_resp.raise_for_status()
     dl_data = dl_resp.json()[0]
 
     if isinstance(dl_data, int) and dl_data < 0:
+        if dl_data == -509:
+            raise BandwidthLimitError(f"Mega bandwidth limit exceeded for {filename}")
         raise RuntimeError(f"Mega API error {dl_data} for {filename}")
 
     dl_url    = dl_data["g"]
@@ -290,7 +339,11 @@ def _mega_download_one_file_sync(
     counter = Counter.new(128, initial_value=initial_value)
     aes = AES.new(a32_to_str(k), AES.MODE_CTR, counter=counter)
 
-    with requests.get(dl_url, stream=True, timeout=(10, None)) as r:
+    with sess.get(dl_url, stream=True, timeout=(10, None)) as r:
+        if r.status_code == 509:
+            raise BandwidthLimitError(
+                f"Mega bandwidth limit exceeded for {filename}"
+            )
         r.raise_for_status()
         with open(file_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -577,7 +630,7 @@ async def process_folder(
                 f"⬇️ **[{file_idx}/{total_files}]** Downloading `{fname}` ({human_size(fsize)})…"
             )
 
-            # ── Download with retry (3 attempts) ──
+            # ── Download with retry (3 attempts + bandwidth wait) ──
             filepath = None
             for attempt in range(1, 4):
                 if cancel_event.is_set():
@@ -600,7 +653,66 @@ async def process_folder(
                     )
                     filepath = Path(result)
                     break  # success
-                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as dl_err:
+
+                except BandwidthLimitError:
+                    # ── Mega 509: try WARP IP rotation first ──
+                    if WARP_ENABLED:
+                        log.warning(
+                            "Bandwidth limit at file %d/%d (%s). Rotating WARP IP…",
+                            file_idx, total_files, fname,
+                        )
+                        await safe_edit(
+                            status_msg,
+                            f"🔄 **Bandwidth limit hit!** Rotating IP via WARP…\n"
+                            f"📍 File **{file_idx}/{total_files}**: `{fname}`"
+                        )
+                        rotated = await asyncio.to_thread(_rotate_warp_ip)
+                        if rotated:
+                            await safe_edit(
+                                status_msg,
+                                f"✅ **New IP obtained!** Retrying `{fname}`…"
+                            )
+                            await asyncio.sleep(2)
+                            continue  # retry with new IP
+                        else:
+                            await safe_edit(
+                                status_msg,
+                                f"⚠️ WARP rotation failed. Falling back to 10-min wait…"
+                            )
+
+                    # ── Fallback: wait 10 minutes ──
+                    wait_minutes = 10
+                    wait_seconds = wait_minutes * 60
+                    log.warning(
+                        "Bandwidth limit hit at file %d/%d (%s). "
+                        "Waiting %d minutes…",
+                        file_idx, total_files, fname, wait_minutes,
+                    )
+                    await safe_edit(
+                        status_msg,
+                        f"⏸️ **Mega bandwidth limit reached!**\n\n"
+                        f"📍 Paused at file **{file_idx}/{total_files}**: `{fname}`\n"
+                        f"⏱️ Waiting **{wait_minutes} minutes** for quota reset…\n"
+                        f"✅ {succeeded} done | ❌ {failed} failed\n\n"
+                        f"💡 Send `/cancel` to stop, or just wait."
+                    )
+                    for remaining in range(wait_seconds, 0, -60):
+                        if cancel_event.is_set():
+                            return
+                        mins_left = remaining // 60
+                        await safe_edit(
+                            status_msg,
+                            f"⏸️ **Mega bandwidth limit — waiting…**\n\n"
+                            f"⏱️ Resuming in **{mins_left} min**\n"
+                            f"📍 Will retry file **{file_idx}/{total_files}**: `{fname}`\n\n"
+                            f"💡 Send `/cancel` to stop."
+                        )
+                        await asyncio.sleep(60)
+                    continue
+
+                except (requests.exceptions.Timeout,
+                        requests.exceptions.ConnectionError,
+                        ConnectionResetError) as dl_err:
                     log.warning("Download attempt %d/3 failed for %s: %s", attempt, fname, dl_err)
                     if attempt < 3:
                         wait_time = 5 * attempt
@@ -616,6 +728,18 @@ async def process_folder(
                             f"❌ Failed `{fname}` after 3 attempts: `{dl_err}`\nSkipping…"
                         )
                         await asyncio.sleep(2)
+
+                except requests.exceptions.HTTPError as dl_err:
+                    # Catch other HTTP errors (not 509) as non-retryable
+                    log.warning("HTTP error for %s: %s", fname, dl_err)
+                    failed += 1
+                    await safe_edit(
+                        status_msg,
+                        f"⚠️ Skipped `{fname}`: `{dl_err}`\nContinuing…"
+                    )
+                    await asyncio.sleep(2)
+                    break
+
                 except Exception as dl_err:
                     log.warning("Skipping %s: %s", fname, dl_err)
                     failed += 1
