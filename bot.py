@@ -76,8 +76,12 @@ app = Client("mega_bot", api_id=APP_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 user_queues:  dict[int, asyncio.Queue] = {}
 user_workers: dict[int, asyncio.Task]  = {}
 user_cancel:  dict[int, asyncio.Event] = {}
+user_skip:    dict[int, asyncio.Event] = {}   # skip current file
 user_status:  dict[int, str]           = {}
 global_semaphore = asyncio.Semaphore(MAX_CONCURRENT_USERS)
+
+# Conversation state: user_id → (msg, link, chat_id, folder_id, file_infos)
+folder_pending: dict[int, tuple] = {}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -183,7 +187,7 @@ def _mega_get_folder_info_sync(url: str) -> tuple[str, list[dict]]:
                 "https://g.api.mega.co.nz/cs",
                 params={"id": 0, "n": folder_id},
                 json=[{"a": "f", "c": 1, "r": 1}],
-                timeout=(10, 120),
+                timeout=(10, 300),
             )
             resp.raise_for_status()
             data = resp.json()
@@ -526,91 +530,175 @@ async def _upload_file(
 #  CORE PROCESSING PIPELINE
 # ──────────────────────────────────────────────────────────────
 
-async def process_link(
+async def process_folder(
     user_id: int,
     chat_id: int,
-    link: str,
+    folder_id: str,
+    file_infos: list[dict],
+    start_from: int,
     status_msg: Message,
     cancel_event: asyncio.Event,
 ) -> None:
+    """
+    Process a Mega folder: download → upload → delete, one file at a time.
+    Starts from the given 1-based index for resumability.
+    """
     user_dir = DOWNLOAD_DIR / str(user_id)
     user_dir.mkdir(parents=True, exist_ok=True)
+    total_files = len(file_infos)
+    succeeded = 0
+    failed = 0
 
     try:
-        if is_mega_folder(link):
-            # ── FOLDER: sequential download-one → upload → delete → next ──
-            await safe_edit(status_msg, "📂 **Fetching folder info from Mega…**")
-            folder_id, file_infos = await asyncio.to_thread(
-                _mega_get_folder_info_sync, link,
-            )
-            total_files = len(file_infos)
+        for file_idx in range(start_from, total_files + 1):
+            if cancel_event.is_set():
+                return
+
+            finfo = file_infos[file_idx - 1]  # 0-based list
+            fname = finfo["filename"]
+            fsize = finfo["file_size"]
+
+            # ── Periodic progress every 100 files ──
+            if (file_idx - start_from) > 0 and (file_idx - start_from) % 100 == 0:
+                disk_path = "/" if os.name != "nt" else "C:\\"
+                disk = psutil.disk_usage(disk_path)
+                await safe_edit(
+                    status_msg,
+                    f"📊 **Progress checkpoint**\n\n"
+                    f"✅ Processed: {succeeded} files\n"
+                    f"⚠️ Failed: {failed} files\n"
+                    f"📍 Current: {file_idx}/{total_files}\n"
+                    f"💾 Disk free: {human_size(disk.free)}"
+                )
+                await asyncio.sleep(2)
+
             await safe_edit(
                 status_msg,
-                f"📂 Found **{total_files}** file(s). Processing one by one…"
+                f"⬇️ **[{file_idx}/{total_files}]** Downloading `{fname}` ({human_size(fsize)})…"
             )
 
-            for file_idx, finfo in enumerate(file_infos, 1):
+            # ── Download with retry (3 attempts) ──
+            filepath = None
+            for attempt in range(1, 4):
                 if cancel_event.is_set():
                     return
 
-                fname = finfo["filename"]
-                fsize = finfo["file_size"]
-                await safe_edit(
-                    status_msg,
-                    f"⬇️ **[{file_idx}/{total_files}]** Downloading `{fname}` ({human_size(fsize)})…"
-                )
+                # Check if user wants to skip this file
+                skip_event = user_skip.get(user_id)
+                if skip_event and skip_event.is_set():
+                    skip_event.clear()
+                    await safe_edit(
+                        status_msg,
+                        f"⏭️ Skipped `{fname}` by user request. Continuing…"
+                    )
+                    await asyncio.sleep(1)
+                    break
 
                 try:
                     result = await asyncio.to_thread(
                         _mega_download_one_file_sync, folder_id, finfo, str(user_dir),
                     )
                     filepath = Path(result)
+                    break  # success
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as dl_err:
+                    log.warning("Download attempt %d/3 failed for %s: %s", attempt, fname, dl_err)
+                    if attempt < 3:
+                        wait_time = 5 * attempt
+                        await safe_edit(
+                            status_msg,
+                            f"⚠️ **[{file_idx}/{total_files}]** Retry {attempt}/3 for `{fname}` in {wait_time}s…"
+                        )
+                        await asyncio.sleep(wait_time)
+                    else:
+                        failed += 1
+                        await safe_edit(
+                            status_msg,
+                            f"❌ Failed `{fname}` after 3 attempts: `{dl_err}`\nSkipping…"
+                        )
+                        await asyncio.sleep(2)
                 except Exception as dl_err:
                     log.warning("Skipping %s: %s", fname, dl_err)
+                    failed += 1
                     await safe_edit(
                         status_msg,
                         f"⚠️ Skipped `{fname}`: `{dl_err}`\nContinuing…"
                     )
                     await asyncio.sleep(2)
-                    continue
+                    break  # non-retryable error
 
+            if filepath is None or not filepath.exists():
+                continue  # skip to next file
+
+            if cancel_event.is_set():
+                await cleanup_path(filepath)
+                return
+
+            # Upload → delete
+            ok = await _upload_file(
+                user_id, filepath, fname, file_idx, total_files,
+                status_msg, cancel_event,
+            )
+            await cleanup_path(filepath)
+            if ok:
+                succeeded += 1
+            else:
+                failed += 1
                 if cancel_event.is_set():
                     return
 
-                # Upload → delete
-                ok = await _upload_file(
-                    user_id, filepath, fname, file_idx, total_files,
-                    status_msg, cancel_event,
-                )
-                # Cleanup this file immediately
-                await cleanup_path(filepath)
-                if not ok:
-                    return
+            # Small delay to avoid Mega API rate-limiting
+            await asyncio.sleep(0.5)
 
-            if not cancel_event.is_set():
-                await safe_edit(status_msg, "✅ **Done!** All files sent to your DM.")
-
-        else:
-            # ── SINGLE FILE ──
-            await safe_edit(status_msg, "⬇️ **Downloading file from Mega…**")
-            result = await asyncio.to_thread(
-                _mega_download_file_sync, link, str(user_dir),
+        if not cancel_event.is_set():
+            await safe_edit(
+                status_msg,
+                f"✅ **Done!** All files processed.\n\n"
+                f"📊 Succeeded: {succeeded} | Failed: {failed} | Total: {total_files}"
             )
-            filepath = Path(result)
 
-            if cancel_event.is_set():
-                return
+    except Exception as exc:
+        log.exception("Error processing folder for user %d", user_id)
+        await safe_edit(
+            status_msg,
+            f"❌ **Error at file {file_idx}/{total_files}:** `{exc}`\n\n"
+            f"💡 Resume with `/start` and send the folder link again,"
+            f" then enter **{file_idx}** to continue from where it stopped."
+        )
+    finally:
+        await cleanup_path(user_dir)
 
-            original_name = filepath.name
-            file_size = filepath.stat().st_size
-            log.info("Downloaded: %s (%s)", original_name, human_size(file_size))
 
-            ok = await _upload_file(
-                user_id, filepath, original_name, 1, 1,
-                status_msg, cancel_event,
-            )
-            if ok and not cancel_event.is_set():
-                await safe_edit(status_msg, "✅ **Done!** File sent to your DM.")
+async def process_single_file(
+    user_id: int,
+    chat_id: int,
+    link: str,
+    status_msg: Message,
+    cancel_event: asyncio.Event,
+) -> None:
+    """Download and upload a single Mega file."""
+    user_dir = DOWNLOAD_DIR / str(user_id)
+    user_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        await safe_edit(status_msg, "⬇️ **Downloading file from Mega…**")
+        result = await asyncio.to_thread(
+            _mega_download_file_sync, link, str(user_dir),
+        )
+        filepath = Path(result)
+
+        if cancel_event.is_set():
+            return
+
+        original_name = filepath.name
+        file_size = filepath.stat().st_size
+        log.info("Downloaded: %s (%s)", original_name, human_size(file_size))
+
+        ok = await _upload_file(
+            user_id, filepath, original_name, 1, 1,
+            status_msg, cancel_event,
+        )
+        if ok and not cancel_event.is_set():
+            await safe_edit(status_msg, "✅ **Done!** File sent to your DM.")
 
     except Exception as exc:
         log.exception("Error processing link %s for user %d", link, user_id)
@@ -626,20 +714,44 @@ async def process_link(
 async def user_worker(user_id: int) -> None:
     q = user_queues[user_id]
     while True:
-        msg, link, chat_id = await q.get()
+        job = await q.get()
         cancel_event = asyncio.Event()
+        skip_event = asyncio.Event()
         user_cancel[user_id] = cancel_event
-        user_status[user_id] = f"Processing: {link[:60]}…"
+        user_skip[user_id] = skip_event
 
         try:
-            status_msg = await app.send_message(user_id, "⏳ **Starting…**")
-            async with global_semaphore:
-                await process_link(user_id, chat_id, link, status_msg, cancel_event)
+            if job["type"] == "folder":
+                folder_id  = job["folder_id"]
+                file_infos = job["file_infos"]
+                start_from = job["start_from"]
+                link       = job["link"]
+                total      = len(file_infos)
+                user_status[user_id] = f"Folder ({start_from}-{total}): {link[:50]}…"
+                status_msg = await app.send_message(
+                    user_id,
+                    f"⏳ **Starting folder download…**\n"
+                    f"📂 {total} files, starting from #{start_from}"
+                )
+                async with global_semaphore:
+                    await process_folder(
+                        user_id, user_id, folder_id, file_infos,
+                        start_from, status_msg, cancel_event,
+                    )
+            else:
+                link = job["link"]
+                user_status[user_id] = f"File: {link[:60]}…"
+                status_msg = await app.send_message(user_id, "⏳ **Starting…**")
+                async with global_semaphore:
+                    await process_single_file(
+                        user_id, user_id, link, status_msg, cancel_event,
+                    )
         except Exception as exc:
             log.exception("Worker error for user %d: %s", user_id, exc)
         finally:
             user_status.pop(user_id, None)
             user_cancel.pop(user_id, None)
+            user_skip.pop(user_id, None)
             q.task_done()
 
         if q.empty():
@@ -666,8 +778,11 @@ async def cmd_start(_, msg: Message):
         "👋 **Welcome to Mega Downloader Bot!**\n\n"
         "Send me any **Mega.nz** file or folder link and I'll download it "
         "and send the files right here.\n\n"
+        "📂 **For folders:** I'll ask which file number to start from, "
+        "so you can resume interrupted downloads!\n\n"
         "**Commands:**\n"
         "• `/cancel` — Stop current download/upload\n"
+        "• `/skip` — Skip the current file and move to next\n"
         "• `/status` — Server & queue info\n\n"
         "You can also use me in **groups** — I'll send files to your DM!",
         disable_web_page_preview=True,
@@ -677,6 +792,8 @@ async def cmd_start(_, msg: Message):
 @app.on_message(filters.command("cancel"))
 async def cmd_cancel(_, msg: Message):
     uid = msg.from_user.id
+    # Also clear any pending folder prompt
+    folder_pending.pop(uid, None)
     event = user_cancel.get(uid)
     if event:
         event.set()
@@ -692,6 +809,17 @@ async def cmd_cancel(_, msg: Message):
         await cleanup_path(DOWNLOAD_DIR / str(uid))
     else:
         await msg.reply("ℹ️ Nothing is running right now.")
+
+
+@app.on_message(filters.command("skip"))
+async def cmd_skip(_, msg: Message):
+    uid = msg.from_user.id
+    event = user_skip.get(uid)
+    if event:
+        event.set()
+        await msg.reply("⏭️ **Skipping current file…**")
+    else:
+        await msg.reply("ℹ️ No file is being processed right now.")
 
 
 @app.on_message(filters.command("status"))
@@ -719,16 +847,52 @@ async def cmd_status(_, msg: Message):
 #  MEGA LINK DETECTOR
 # ──────────────────────────────────────────────────────────────
 
-@app.on_message(filters.text & ~filters.command(["start", "cancel", "status"]))
+@app.on_message(filters.text & ~filters.command(["start", "cancel", "status", "skip"]))
 async def detect_mega_link(_, msg: Message):
     if not msg.text:
         return
 
+    user_id = msg.from_user.id
+
+    # ── Check if user is replying with a start-from number ──
+    if user_id in folder_pending:
+        text = msg.text.strip()
+        if text.isdigit():
+            start_from = int(text)
+            pending = folder_pending.pop(user_id)
+            orig_msg, link, chat_id, folder_id, file_infos = pending
+            total = len(file_infos)
+
+            if start_from < 1 or start_from > total:
+                await msg.reply(
+                    f"❌ Invalid number. Must be between **1** and **{total}**.\n"
+                    f"Please send a valid number:"
+                )
+                folder_pending[user_id] = pending  # put it back
+                return
+
+            await msg.reply(
+                f"✅ Starting download from file **#{start_from}** out of **{total}**."
+            )
+
+            q = ensure_worker(user_id)
+            await q.put({
+                "type": "folder",
+                "link": link,
+                "folder_id": folder_id,
+                "file_infos": file_infos,
+                "start_from": start_from,
+            })
+            return
+        else:
+            # Not a number — clear pending and fall through to link detection
+            folder_pending.pop(user_id, None)
+
+    # ── Normal link detection ──
     links = MEGA_LINK_RE.findall(msg.text)
     if not links:
         return
 
-    user_id = msg.from_user.id
     is_group = msg.chat.type in ("group", "supergroup")
 
     if is_group:
@@ -737,19 +901,54 @@ async def detect_mega_link(_, msg: Message):
             disable_web_page_preview=True,
         )
 
-    q = ensure_worker(user_id)
     for link in links:
-        position = q.qsize() + 1
-        await q.put((msg, link, msg.chat.id))
-        if position > 1:
+        if is_mega_folder(link):
+            # ── FOLDER: fetch metadata, then ask for start number ──
+            fetching_msg = await msg.reply(
+                "📂 **Fetching folder info from Mega…** Please wait.",
+                disable_web_page_preview=True,
+            )
             try:
-                await app.send_message(
-                    user_id,
-                    f"📋 **Queued** (position #{position}): `{link[:80]}`",
-                    disable_web_page_preview=True,
+                folder_id, file_infos = await asyncio.to_thread(
+                    _mega_get_folder_info_sync, link,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                await safe_edit(
+                    fetching_msg,
+                    f"❌ Failed to fetch folder info: `{exc}`",
+                )
+                continue
+
+            total = len(file_infos)
+            await safe_edit(
+                fetching_msg,
+                f"📂 **Found {total} file(s)** in this folder.\n\n"
+                f"📝 **Send a number to start downloading from:**\n"
+                f"• Send `1` to download all files from the beginning\n"
+                f"• Send any number (e.g. `500`) to resume from that file\n\n"
+                f"_(Valid range: 1 to {total})_",
+            )
+
+            # Store pending state
+            folder_pending[user_id] = (msg, link, msg.chat.id, folder_id, file_infos)
+
+        else:
+            # ── SINGLE FILE: queue immediately ──
+            q = ensure_worker(user_id)
+            position = q.qsize() + 1
+            await q.put({
+                "type": "file",
+                "link": link,
+            })
+            if position > 1:
+                try:
+                    await app.send_message(
+                        user_id,
+                        f"📋 **Queued** (position #{position}): `{link[:80]}`",
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    pass
 
 
 # ──────────────────────────────────────────────────────────────
