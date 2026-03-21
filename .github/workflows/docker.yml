@@ -1,10 +1,13 @@
-
 name: Build and Push Docker Image
 
 on:
   push:
     branches:
-      - main # Change this to 'master' if your default branch is master
+      - main 
+
+# Forces GitHub to use the new Node 24 environment and silences warnings
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
@@ -20,8 +23,9 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Build and push the image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6 
         with:
           context: .
           push: true
-          tags: bitu757/megadownloader:latest
+          # Automatically uses your secret username and tags it as requested
+          tags: ${{ secrets.DOCKER_USERNAME }}/megadownloader:latest
