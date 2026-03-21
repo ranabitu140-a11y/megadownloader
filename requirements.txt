@@ -6,3 +6,4 @@ psutil
 python-dotenv
 requests
 opencv-python-headless
+tgcrypto
