@@ -126,19 +126,18 @@ def load_proxies():
 # Load the proxies immediately when the bot starts
 load_proxies()
 
-def _get_proxied_session() -> requests.Session:
-    """Return a requests Session with a random proxy from the API list."""
+def _get_session(use_proxy=False) -> requests.Session:
+    """Return a standard requests Session, or a proxied one if explicitly requested."""
     s = requests.Session()
     
-    # Reload the list if it gets emptied
-    if not CACHED_PROXIES:
-        load_proxies()
-        
-    if CACHED_PROXIES:
-        current_proxy = random.choice(CACHED_PROXIES)
-        s.proxies = current_proxy
-        log.info(f"Using proxy: {current_proxy['http']}")
-        
+    if use_proxy:
+        if not CACHED_PROXIES:
+            load_proxies()
+        if CACHED_PROXIES:
+            current_proxy = random.choice(CACHED_PROXIES)
+            s.proxies = current_proxy
+            log.info(f"🛡️ 509 Fallback: Using proxy {current_proxy['http']}")
+            
     return s
 
 
@@ -238,15 +237,17 @@ def _mega_get_folder_info_sync(url: str) -> tuple[str, list[dict]]:
     folder_key = str_to_a32(folder_key_bytes)
 
     # Get folder listing with retry
+    # Get folder listing (STRICTLY DIRECT, NO PROXY)
     data = None
-    for attempt in range(1, 4):
+    MAX_RETRIES = 3
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            sess = _get_proxied_session()
+            sess = _get_session(use_proxy=False) # <--- ALWAYS DIRECT
             resp = sess.post(
                 "https://g.api.mega.co.nz/cs",
                 params={"id": 0, "n": folder_id},
                 json=[{"a": "f", "c": 1, "r": 1}],
-                timeout=(10, 300),
+                timeout=(10, 30),
             )
             resp.raise_for_status()
             data = resp.json()
@@ -313,7 +314,7 @@ def _mega_get_folder_info_sync(url: str) -> tuple[str, list[dict]]:
 # ──────────────────────────────────────────────────────────────
 
 def _mega_download_one_file_sync(
-    folder_id: str, file_info: dict, dest_dir: str,
+    folder_id: str, file_info: dict, dest_dir: str, use_proxy: bool = False
 ) -> str:
     """
     Download a SINGLE file from a Mega folder using its pre-decrypted keys.
@@ -325,7 +326,7 @@ def _mega_download_one_file_sync(
     iv       = file_info["iv"]
 
     # Get download URL (through WARP proxy if enabled)
-    sess = _get_proxied_session()
+    sess = _get_session(use_proxy=use_proxy)
     dl_resp = sess.post(
         "https://g.api.mega.co.nz/cs",
         params={"id": 1, "n": folder_id},
@@ -647,8 +648,12 @@ async def process_folder(
             )
 
             # ── Download with retry (3 attempts + bandwidth wait) ──
+            # ── Download with Smart Proxy Fallback ──
             filepath = None
-            for attempt in range(1, 4):
+            MAX_DL_RETRIES = 15
+            force_proxy = False  # Start direct!
+            
+            for attempt in range(1, MAX_DL_RETRIES + 1):
                 if cancel_event.is_set():
                     return
 
@@ -656,34 +661,32 @@ async def process_folder(
                 skip_event = user_skip.get(user_id)
                 if skip_event and skip_event.is_set():
                     skip_event.clear()
-                    await safe_edit(
-                        status_msg,
-                        f"⏭️ Skipped `{fname}` by user request. Continuing…"
-                    )
+                    await safe_edit(status_msg, f"⏭️ Skipped `{fname}`. Continuing…")
                     await asyncio.sleep(1)
                     break
 
                 try:
+                    # Pass the force_proxy flag to the download function
                     result = await asyncio.to_thread(
-                        _mega_download_one_file_sync, folder_id, finfo, str(user_dir),
+                        _mega_download_one_file_sync, folder_id, finfo, str(user_dir), force_proxy
                     )
                     filepath = Path(result)
-                    break  # success
+                    break  # success!
 
                 except BandwidthLimitError:
-                    # ── Mega 509: try next proxy first ──
+                    # ── Mega 509: Enable Proxy Mode ──
+                    force_proxy = True  # All future attempts for this file will use proxies
+                    
                     if CACHED_PROXIES:
-                        log.warning(
-                            "Bandwidth limit at file %d/%d (%s). Trying a new proxy…",
-                            file_idx, total_files, fname,
-                        )
+                        log.warning("Bandwidth limit on %s. Enabling Proxy Fallback…", fname)
                         await safe_edit(
                             status_msg,
-                            f"🔄 **Bandwidth limit hit!** Switching to a new proxy…\n"
-                            f"📍 File **{file_idx}/{total_files}**: `{fname}`"
+                            f"🔄 **Mega Quota Hit!** Activating SOCKS5 Proxy evasion…\n"
+                            f"📍 File: `{fname}`"
                         )
-                        await asyncio.sleep(2)
-                        continue  # Because of how the loop works, 'continue' will automatically call _get_proxied_session() again, which grabs a random new proxy!
+                        await asyncio.sleep(1)
+                        continue
+                        # Because of how the loop works, 'continue' will automatically call _get_proxied_session() again, which grabs a random new proxy!
 
                     # ── Fallback: wait 10 minutes ──
                     wait_minutes = 10
