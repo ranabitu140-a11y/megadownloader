@@ -61,9 +61,9 @@ SPLIT_READ_BUF = 8 * 1024 * 1024          # 8 MB I/O buffer
 PROGRESS_EDIT_INTERVAL = 3                 # seconds between edits
 MAX_CONCURRENT_USERS = 5
 
-# ── ProxyScrape API Configuration ──
-# Changed protocol to SOCKS5 and increased timeout slightly to find more stable nodes
-PROXY_API_URL = "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=3000&country=all&anonymity=all"
+# ── Proxy Configuration ──
+# Using the GitHub openproxylist repository to guarantee a large pool of SOCKS5 IPs
+PROXY_API_URL = "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt"
 CACHED_PROXIES = []
 
 MEGA_LINK_RE = re.compile(
@@ -104,17 +104,17 @@ class BandwidthLimitError(Exception):
     pass
 
 def load_proxies():
-    """Fetches the latest fast SOCKS5 proxies from ProxyScrape."""
+    """Fetches the latest SOCKS5 proxies from GitHub."""
     global CACHED_PROXIES
     try:
-        log.info("Fetching latest SOCKS5 proxies from ProxyScrape API...")
+        log.info("Fetching latest SOCKS5 proxies from GitHub...")
         resp = requests.get(PROXY_API_URL, timeout=10)
         resp.raise_for_status()
         
-        # The API returns IP:PORT separated by newlines
-        raw_ips = resp.text.strip().split('\r\n') 
+        # Split by \n to handle GitHub's text formatting safely
+        raw_ips = resp.text.strip().split('\n') 
         
-        # Format them using socks5h:// (This ensures DNS resolves on the proxy side)
+        # Format them using socks5h:// (Forces DNS resolution on the proxy side)
         CACHED_PROXIES = [
             {"http": f"socks5h://{ip.strip()}", "https": f"socks5h://{ip.strip()}"} 
             for ip in raw_ips if ip.strip()
