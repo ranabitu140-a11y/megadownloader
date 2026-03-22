@@ -14,6 +14,7 @@ import re
 import math
 import time
 import shutil
+import random
 import asyncio
 import logging
 from pathlib import Path
@@ -60,9 +61,9 @@ SPLIT_READ_BUF = 8 * 1024 * 1024          # 8 MB I/O buffer
 PROGRESS_EDIT_INTERVAL = 3                 # seconds between edits
 MAX_CONCURRENT_USERS = 5
 
-# ── WARP Proxy (set in .env to enable) ──
-WARP_PROXY = os.environ.get("WARP_PROXY", "").strip()  # e.g. socks5h://127.0.0.1:40000
-WARP_ENABLED = bool(WARP_PROXY)
+# ── ProxyScrape API Configuration ──
+PROXY_API_URL = "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=1000&country=all&ssl=all&anonymity=all"
+CACHED_PROXIES = []
 
 MEGA_LINK_RE = re.compile(
     r"https?://mega\.nz/(?:file|folder|#|#!|#F!)[^\s]+"
@@ -101,38 +102,43 @@ class BandwidthLimitError(Exception):
     """Raised when Mega returns 509 Bandwidth Limit Exceeded."""
     pass
 
+def load_proxies():
+    """Fetches the latest fast proxies from ProxyScrape."""
+    global CACHED_PROXIES
+    try:
+        log.info("Fetching latest proxies from ProxyScrape API...")
+        resp = requests.get(PROXY_API_URL, timeout=10)
+        resp.raise_for_status()
+        
+        # The API returns IP:PORT separated by newlines
+        raw_ips = resp.text.strip().split('\r\n') 
+        
+        # Format them for the requests library
+        CACHED_PROXIES = [
+            {"http": f"http://{ip.strip()}", "https": f"http://{ip.strip()}"} 
+            for ip in raw_ips if ip.strip()
+        ]
+        log.info(f"✅ Successfully loaded {len(CACHED_PROXIES)} proxies.")
+    except Exception as e:
+        log.warning(f"Failed to fetch proxies: {e}")
+
+# Load the proxies immediately when the bot starts
+load_proxies()
 
 def _get_proxied_session() -> requests.Session:
-    """Return a requests Session with WARP SOCKS5 proxy if configured."""
+    """Return a requests Session with a random proxy from the API list."""
     s = requests.Session()
-    if WARP_ENABLED:
-        s.proxies = {"http": WARP_PROXY, "https": WARP_PROXY}
+    
+    # Reload the list if it gets emptied
+    if not CACHED_PROXIES:
+        load_proxies()
+        
+    if CACHED_PROXIES:
+        current_proxy = random.choice(CACHED_PROXIES)
+        s.proxies = current_proxy
+        log.info(f"Using proxy: {current_proxy['http']}")
+        
     return s
-
-
-def _rotate_warp_ip() -> bool:
-    """
-    Disconnect and reconnect Cloudflare WARP to get a fresh IP.
-    Returns True if successful.
-    """
-    if not WARP_ENABLED:
-        return False
-    try:
-        subprocess.run(["warp-cli", "disconnect"], timeout=10,
-                       capture_output=True, check=False)
-        import time as _time
-        _time.sleep(2)
-        result = subprocess.run(["warp-cli", "connect"], timeout=15,
-                                capture_output=True, check=False)
-        _time.sleep(3)  # wait for connection to establish
-        log.info("WARP IP rotated (exit code: %d)", result.returncode)
-        return result.returncode == 0
-    except FileNotFoundError:
-        log.warning("warp-cli not found, cannot rotate IP")
-        return False
-    except Exception as exc:
-        log.warning("WARP rotation failed: %s", exc)
-        return False
 
 
 # ──────────────────────────────────────────────────────────────
@@ -664,30 +670,19 @@ async def process_folder(
                     break  # success
 
                 except BandwidthLimitError:
-                    # ── Mega 509: try WARP IP rotation first ──
-                    if WARP_ENABLED:
+                    # ── Mega 509: try next proxy first ──
+                    if CACHED_PROXIES:
                         log.warning(
-                            "Bandwidth limit at file %d/%d (%s). Rotating WARP IP…",
+                            "Bandwidth limit at file %d/%d (%s). Trying a new proxy…",
                             file_idx, total_files, fname,
                         )
                         await safe_edit(
                             status_msg,
-                            f"🔄 **Bandwidth limit hit!** Rotating IP via WARP…\n"
+                            f"🔄 **Bandwidth limit hit!** Switching to a new proxy…\n"
                             f"📍 File **{file_idx}/{total_files}**: `{fname}`"
                         )
-                        rotated = await asyncio.to_thread(_rotate_warp_ip)
-                        if rotated:
-                            await safe_edit(
-                                status_msg,
-                                f"✅ **New IP obtained!** Retrying `{fname}`…"
-                            )
-                            await asyncio.sleep(2)
-                            continue  # retry with new IP
-                        else:
-                            await safe_edit(
-                                status_msg,
-                                f"⚠️ WARP rotation failed. Falling back to 10-min wait…"
-                            )
+                        await asyncio.sleep(2)
+                        continue  # Because of how the loop works, 'continue' will automatically call _get_proxied_session() again, which grabs a random new proxy!
 
                     # ── Fallback: wait 10 minutes ──
                     wait_minutes = 10
