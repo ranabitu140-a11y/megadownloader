@@ -8,3 +8,4 @@ opencv-python-headless
 tgcrypto
 requests[socks]
 PySocks
+Flask==3.0.3
