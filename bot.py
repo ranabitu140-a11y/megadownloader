@@ -22,6 +22,8 @@ import subprocess
 
 from dotenv import load_dotenv
 load_dotenv()
+from flask import Flask
+from threading import Thread
 
 # ── Python 3.12+ compatibility shim for mega.py ──
 if not hasattr(asyncio, "coroutine"):
@@ -1076,9 +1078,31 @@ async def detect_mega_link(_, msg: Message):
 
 
 # ──────────────────────────────────────────────────────────────
+#  FLASK KEEP-ALIVE (For Render Web Service)
+# ──────────────────────────────────────────────────────────────
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def home():
+    return "Mega Downloader Bot is running successfully on Render!", 200
+
+def run_server():
+    # Render automatically provides a PORT environment variable
+    port = int(os.environ.get("PORT", 8080))
+    web_app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    # Run Flask in a daemon thread so it doesn't block Pyrogram
+    server_thread = Thread(target=run_server, daemon=True)
+    server_thread.start()
+
+# ──────────────────────────────────────────────────────────────
 #  ENTRY POINT
 # ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    log.info("Starting Flask Keep-Alive Server…")
+    keep_alive()
+    
     log.info("Starting Mega Downloader Bot…")
     app.run()
