@@ -62,7 +62,8 @@ PROGRESS_EDIT_INTERVAL = 3                 # seconds between edits
 MAX_CONCURRENT_USERS = 5
 
 # ── ProxyScrape API Configuration ──
-PROXY_API_URL = "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=1000&country=all&ssl=all&anonymity=all"
+# Changed protocol to SOCKS5 and increased timeout slightly to find more stable nodes
+PROXY_API_URL = "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=3000&country=all&anonymity=all"
 CACHED_PROXIES = []
 
 MEGA_LINK_RE = re.compile(
@@ -103,22 +104,22 @@ class BandwidthLimitError(Exception):
     pass
 
 def load_proxies():
-    """Fetches the latest fast proxies from ProxyScrape."""
+    """Fetches the latest fast SOCKS5 proxies from ProxyScrape."""
     global CACHED_PROXIES
     try:
-        log.info("Fetching latest proxies from ProxyScrape API...")
+        log.info("Fetching latest SOCKS5 proxies from ProxyScrape API...")
         resp = requests.get(PROXY_API_URL, timeout=10)
         resp.raise_for_status()
         
         # The API returns IP:PORT separated by newlines
         raw_ips = resp.text.strip().split('\r\n') 
         
-        # Format them for the requests library
+        # Format them using socks5h:// (This ensures DNS resolves on the proxy side)
         CACHED_PROXIES = [
-            {"http": f"http://{ip.strip()}", "https": f"http://{ip.strip()}"} 
+            {"http": f"socks5h://{ip.strip()}", "https": f"socks5h://{ip.strip()}"} 
             for ip in raw_ips if ip.strip()
         ]
-        log.info(f"✅ Successfully loaded {len(CACHED_PROXIES)} proxies.")
+        log.info(f"✅ Successfully loaded {len(CACHED_PROXIES)} SOCKS5 proxies.")
     except Exception as e:
         log.warning(f"Failed to fetch proxies: {e}")
 
