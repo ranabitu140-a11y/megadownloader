@@ -11,6 +11,7 @@ for folder downloads with AES decryption.
 
 import os
 import re
+import json
 import math
 import time
 import shutil
@@ -19,6 +20,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 import subprocess
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -65,8 +67,16 @@ WARP_PROXY = os.environ.get("WARP_PROXY", "").strip()  # e.g. socks5h://127.0.0.
 WARP_ENABLED = bool(WARP_PROXY)
 
 MEGA_LINK_RE = re.compile(
-    r"https?://mega\.nz/(?:file|folder|#|#!|#F!)[^\s]+"
+    r"https?://(?:www\.)?(?:mega\.nz|mega\.co\.nz)/(?:file|folder|#|#!|#F!)[^\s]+",
+    re.IGNORECASE,
 )
+
+MEGA_DOMAINS = {
+    "mega.nz",
+    "www.mega.nz",
+    "mega.co.nz",
+    "www.mega.co.nz",
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -171,29 +181,72 @@ async def cleanup_path(path: Path) -> None:
 
 def is_mega_folder(url: str) -> bool:
     """Check if a Mega URL points to a folder."""
-    return "/folder/" in url or "/#F!" in url
+    try:
+        kind, _, _ = parse_mega_link(url)
+        return kind == "folder"
+    except ValueError:
+        return False
+
+
+def normalize_mega_url(url: str) -> str:
+    """Trim punctuation/wrappers that often cling to pasted Mega URLs."""
+    return url.strip().strip("<>[](){}\"'`,.;")
+
+
+def parse_mega_link(url: str) -> tuple[str, str, str]:
+    """
+    Parse a public Mega link and return (kind, handle, key).
+
+    Supports both old fragment-based links and current path-based links,
+    plus common Mega domains such as mega.co.nz and www.mega.nz.
+    """
+    normalized = normalize_mega_url(url)
+    parsed = urlsplit(normalized)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"Unsupported Mega URL scheme: {url}")
+
+    host = parsed.netloc.lower()
+    if host not in MEGA_DOMAINS:
+        raise ValueError(f"Unsupported Mega host: {url}")
+
+    path_parts = [part for part in parsed.path.split("/") if part]
+    fragment = parsed.fragment
+
+    if len(path_parts) >= 2 and path_parts[0] in {"file", "folder"}:
+        kind = path_parts[0]
+        handle = path_parts[1]
+        key = fragment.split("/", 1)[0]
+        if handle and key:
+            return kind, handle, key
+
+    if fragment.startswith("F!"):
+        parts = fragment[2:].split("!", 2)
+        if len(parts) >= 2 and parts[0] and parts[1]:
+            return "folder", parts[0], parts[1]
+
+    if fragment.startswith("!"):
+        parts = fragment[1:].split("!", 1)
+        if len(parts) == 2 and parts[0] and parts[1]:
+            return "file", parts[0], parts[1]
+
+    raise ValueError(f"Cannot parse Mega URL: {url}")
 
 
 def parse_mega_folder_url(url: str) -> tuple[str, str]:
     """Extract (folder_id, folder_key_b64) from a folder URL."""
-    # New format: mega.nz/folder/ID#KEY
-    m = re.match(r"https?://mega\.nz/folder/([^#]+)#(.+)", url)
-    if m:
-        return m.group(1), m.group(2)
-    # Old format: mega.nz/#F!ID!KEY
-    m = re.match(r"https?://mega\.nz/#F!([^!]+)!(.+)", url)
-    if m:
-        return m.group(1), m.group(2)
-    raise ValueError(f"Cannot parse Mega folder URL: {url}")
+    kind, folder_id, folder_key_b64 = parse_mega_link(url)
+    if kind != "folder":
+        raise ValueError(f"Not a Mega folder URL: {url}")
+    return folder_id, folder_key_b64
 
 
 def convert_mega_file_url(url: str) -> str:
     """Convert new-format file URL to old format for mega.py compatibility."""
     # mega.nz/file/ID#KEY → mega.nz/#!ID!KEY
-    m = re.match(r"https?://mega\.nz/file/([^#]+)#(.+)", url)
-    if m:
-        return f"https://mega.nz/#!{m.group(1)}!{m.group(2)}"
-    return url  # already old format or something else
+    kind, file_id, file_key_b64 = parse_mega_link(url)
+    if kind != "file":
+        raise ValueError(f"Not a Mega file URL: {url}")
+    return f"https://mega.nz/#!{file_id}!{file_key_b64}"
 
 
 # ──────────────────────────────────────────────────────────────
@@ -232,14 +285,20 @@ def _mega_get_folder_info_sync(url: str) -> tuple[str, list[dict]]:
             resp = sess.post(
                 "https://g.api.mega.co.nz/cs",
                 params={"id": 0, "n": folder_id},
-                json=[{"a": "f", "c": 1, "r": 1}],
+                data=json.dumps([{"a": "f", "c": 1, "r": 1}]),
+                headers={"Content-Type": "application/json"},
                 timeout=(10, 300),
             )
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, int) and data < 0:
                 raise RuntimeError(f"Mega API error code: {data}")
-            data = data[0]
+            if isinstance(data, list) and data:
+                data = data[0]
+            if isinstance(data, int) and data < 0:
+                raise RuntimeError(f"Mega API error code: {data}")
+            if not isinstance(data, dict):
+                raise RuntimeError(f"Unexpected Mega API response: {data!r}")
             break
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             log.warning("Folder listing attempt %d/3 failed: %s", attempt, e)
@@ -316,18 +375,23 @@ def _mega_download_one_file_sync(
     dl_resp = sess.post(
         "https://g.api.mega.co.nz/cs",
         params={"id": 1, "n": folder_id},
-        json=[{"a": "g", "g": 1, "n": handle}],
+        data=json.dumps([{"a": "g", "g": 1, "n": handle}]),
+        headers={"Content-Type": "application/json"},
         timeout=(10, 120),
     )
     if dl_resp.status_code == 509:
         raise BandwidthLimitError(f"Mega bandwidth limit exceeded for {filename}")
     dl_resp.raise_for_status()
-    dl_data = dl_resp.json()[0]
+    dl_data = dl_resp.json()
+    if isinstance(dl_data, list) and dl_data:
+        dl_data = dl_data[0]
 
     if isinstance(dl_data, int) and dl_data < 0:
         if dl_data == -509:
             raise BandwidthLimitError(f"Mega bandwidth limit exceeded for {filename}")
         raise RuntimeError(f"Mega API error {dl_data} for {filename}")
+    if not isinstance(dl_data, dict):
+        raise RuntimeError(f"Unexpected Mega API response for {filename}: {dl_data!r}")
 
     dl_url    = dl_data["g"]
     file_size = dl_data["s"]
