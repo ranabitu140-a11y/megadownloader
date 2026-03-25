@@ -61,6 +61,7 @@ CHUNK_SIZE = 2 * 1024 * 1024 * 1024 - 10 * 1024 * 1024   # ~1.99 GB
 SPLIT_READ_BUF = 8 * 1024 * 1024          # 8 MB I/O buffer
 PROGRESS_EDIT_INTERVAL = 3                 # seconds between edits
 MAX_CONCURRENT_USERS = 5
+MEGA_API_RETRIES = 5
 
 # ── WARP Proxy (set in .env to enable) ──
 WARP_PROXY = os.environ.get("WARP_PROXY", "").strip()  # e.g. socks5h://127.0.0.1:40000
@@ -279,7 +280,7 @@ def _mega_get_folder_info_sync(url: str) -> tuple[str, list[dict]]:
 
     # Get folder listing with retry
     data = None
-    for attempt in range(1, 4):
+    for attempt in range(1, MEGA_API_RETRIES + 1):
         try:
             sess = _get_proxied_session()
             resp = sess.post(
@@ -292,18 +293,36 @@ def _mega_get_folder_info_sync(url: str) -> tuple[str, list[dict]]:
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, int) and data < 0:
+                if data == -3:
+                    raise RuntimeError("Mega API error code: -3")
                 raise RuntimeError(f"Mega API error code: {data}")
             if isinstance(data, list) and data:
                 data = data[0]
             if isinstance(data, int) and data < 0:
+                if data == -3:
+                    raise RuntimeError("Mega API error code: -3")
                 raise RuntimeError(f"Mega API error code: {data}")
             if not isinstance(data, dict):
                 raise RuntimeError(f"Unexpected Mega API response: {data!r}")
             break
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            log.warning("Folder listing attempt %d/3 failed: %s", attempt, e)
-            if attempt == 3:
-                raise RuntimeError(f"Failed to fetch folder after 3 attempts: {e}") from e
+            log.warning("Folder listing attempt %d/%d failed: %s", attempt, MEGA_API_RETRIES, e)
+            if attempt == MEGA_API_RETRIES:
+                raise RuntimeError(f"Failed to fetch folder after {MEGA_API_RETRIES} attempts: {e}") from e
+            import time as _time
+            _time.sleep(3 * attempt)
+        except RuntimeError as e:
+            if "Mega API error code: -3" not in str(e):
+                raise
+            log.warning(
+                "Folder listing attempt %d/%d got transient Mega error -3",
+                attempt,
+                MEGA_API_RETRIES,
+            )
+            if attempt == MEGA_API_RETRIES:
+                raise RuntimeError(
+                    f"Failed to fetch folder after {MEGA_API_RETRIES} attempts: {e}"
+                ) from e
             import time as _time
             _time.sleep(3 * attempt)
 
@@ -371,27 +390,39 @@ def _mega_download_one_file_sync(
     iv       = file_info["iv"]
 
     # Get download URL (through WARP proxy if enabled)
+    dl_data = None
     sess = _get_proxied_session()
-    dl_resp = sess.post(
-        "https://g.api.mega.co.nz/cs",
-        params={"id": 1, "n": folder_id},
-        data=json.dumps([{"a": "g", "g": 1, "n": handle}]),
-        headers={"Content-Type": "application/json"},
-        timeout=(10, 120),
-    )
-    if dl_resp.status_code == 509:
-        raise BandwidthLimitError(f"Mega bandwidth limit exceeded for {filename}")
-    dl_resp.raise_for_status()
-    dl_data = dl_resp.json()
-    if isinstance(dl_data, list) and dl_data:
-        dl_data = dl_data[0]
-
-    if isinstance(dl_data, int) and dl_data < 0:
-        if dl_data == -509:
+    for attempt in range(1, MEGA_API_RETRIES + 1):
+        dl_resp = sess.post(
+            "https://g.api.mega.co.nz/cs",
+            params={"id": 1, "n": folder_id},
+            data=json.dumps([{"a": "g", "g": 1, "n": handle}]),
+            headers={"Content-Type": "application/json"},
+            timeout=(10, 120),
+        )
+        if dl_resp.status_code == 509:
             raise BandwidthLimitError(f"Mega bandwidth limit exceeded for {filename}")
-        raise RuntimeError(f"Mega API error {dl_data} for {filename}")
-    if not isinstance(dl_data, dict):
-        raise RuntimeError(f"Unexpected Mega API response for {filename}: {dl_data!r}")
+        dl_resp.raise_for_status()
+        dl_data = dl_resp.json()
+        if isinstance(dl_data, list) and dl_data:
+            dl_data = dl_data[0]
+
+        if isinstance(dl_data, int) and dl_data < 0:
+            if dl_data == -509:
+                raise BandwidthLimitError(f"Mega bandwidth limit exceeded for {filename}")
+            if dl_data == -3 and attempt < MEGA_API_RETRIES:
+                log.warning(
+                    "Download-url attempt %d/%d got transient Mega error -3 for %s",
+                    attempt,
+                    MEGA_API_RETRIES,
+                    filename,
+                )
+                time.sleep(2 * attempt)
+                continue
+            raise RuntimeError(f"Mega API error {dl_data} for {filename}")
+        if not isinstance(dl_data, dict):
+            raise RuntimeError(f"Unexpected Mega API response for {filename}: {dl_data!r}")
+        break
 
     dl_url    = dl_data["g"]
     file_size = dl_data["s"]
