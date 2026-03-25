@@ -14,7 +14,6 @@ import re
 import math
 import time
 import shutil
-import random
 import asyncio
 import logging
 from pathlib import Path
@@ -42,8 +41,8 @@ from mega.crypto import (
 from Crypto.Cipher import AES
 from Crypto.Util import Counter
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from pyrogram.errors import FloodWait, BadRequest, PeerIdInvalid, ChannelInvalid
+from pyrogram.types import Message
+from pyrogram.errors import FloodWait, BadRequest
 
 # ──────────────────────────────────────────────────────────────
 #  CONFIGURATION
@@ -61,10 +60,9 @@ SPLIT_READ_BUF = 8 * 1024 * 1024          # 8 MB I/O buffer
 PROGRESS_EDIT_INTERVAL = 3                 # seconds between edits
 MAX_CONCURRENT_USERS = 5
 
-# ── Proxy Configuration ──
-# Using the GitHub openproxylist repository to guarantee a large pool of SOCKS5 IPs
-PROXY_API_URL = "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt"
-CACHED_PROXIES = []
+# ── WARP Proxy (set in .env to enable) ──
+WARP_PROXY = os.environ.get("WARP_PROXY", "").strip()  # e.g. socks5h://127.0.0.1:40000
+WARP_ENABLED = bool(WARP_PROXY)
 
 MEGA_LINK_RE = re.compile(
     r"https?://mega\.nz/(?:file|folder|#|#!|#F!)[^\s]+"
@@ -92,53 +90,43 @@ global_semaphore = asyncio.Semaphore(MAX_CONCURRENT_USERS)
 # Conversation state: user_id → (msg, link, chat_id, folder_id, file_infos)
 folder_pending: dict[int, tuple] = {}
 
-# Destination state pending: user_id → JobDict (used to hold job details until a destination is selected)
-destination_pending: dict[int, dict] = {}
-
-# Channel ID state pending: user_id → JobDict
-channel_id_pending: dict[int, dict] = {}
-
 
 class BandwidthLimitError(Exception):
     """Raised when Mega returns 509 Bandwidth Limit Exceeded."""
     pass
 
-def load_proxies():
-    """Fetches the latest SOCKS5 proxies from GitHub."""
-    global CACHED_PROXIES
-    try:
-        log.info("Fetching latest SOCKS5 proxies from GitHub...")
-        resp = requests.get(PROXY_API_URL, timeout=10)
-        resp.raise_for_status()
-        
-        # Split by \n to handle GitHub's text formatting safely
-        raw_ips = resp.text.strip().split('\n') 
-        
-        # Format them using socks5h:// (Forces DNS resolution on the proxy side)
-        CACHED_PROXIES = [
-            {"http": f"socks5h://{ip.strip()}", "https": f"socks5h://{ip.strip()}"} 
-            for ip in raw_ips if ip.strip()
-        ]
-        log.info(f"✅ Successfully loaded {len(CACHED_PROXIES)} SOCKS5 proxies.")
-    except Exception as e:
-        log.warning(f"Failed to fetch proxies: {e}")
 
-# Load the proxies immediately when the bot starts
-load_proxies()
-
-def _get_session(use_proxy=False) -> requests.Session:
-    """Return a standard requests Session, or a proxied one if explicitly requested."""
+def _get_proxied_session() -> requests.Session:
+    """Return a requests Session with WARP SOCKS5 proxy if configured."""
     s = requests.Session()
-    
-    if use_proxy:
-        if not CACHED_PROXIES:
-            load_proxies()
-        if CACHED_PROXIES:
-            current_proxy = random.choice(CACHED_PROXIES)
-            s.proxies = current_proxy
-            log.info(f"🛡️ 509 Fallback: Using proxy {current_proxy['http']}")
-            
+    if WARP_ENABLED:
+        s.proxies = {"http": WARP_PROXY, "https": WARP_PROXY}
     return s
+
+
+def _rotate_warp_ip() -> bool:
+    """
+    Disconnect and reconnect Cloudflare WARP to get a fresh IP.
+    Returns True if successful.
+    """
+    if not WARP_ENABLED:
+        return False
+    try:
+        subprocess.run(["warp-cli", "disconnect"], timeout=10,
+                       capture_output=True, check=False)
+        import time as _time
+        _time.sleep(2)
+        result = subprocess.run(["warp-cli", "connect"], timeout=15,
+                                capture_output=True, check=False)
+        _time.sleep(3)  # wait for connection to establish
+        log.info("WARP IP rotated (exit code: %d)", result.returncode)
+        return result.returncode == 0
+    except FileNotFoundError:
+        log.warning("warp-cli not found, cannot rotate IP")
+        return False
+    except Exception as exc:
+        log.warning("WARP rotation failed: %s", exc)
+        return False
 
 
 # ──────────────────────────────────────────────────────────────
@@ -237,17 +225,15 @@ def _mega_get_folder_info_sync(url: str) -> tuple[str, list[dict]]:
     folder_key = str_to_a32(folder_key_bytes)
 
     # Get folder listing with retry
-    # Get folder listing (STRICTLY DIRECT, NO PROXY)
     data = None
-    MAX_RETRIES = 3
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, 4):
         try:
-            sess = _get_session(use_proxy=False) # <--- ALWAYS DIRECT
+            sess = _get_proxied_session()
             resp = sess.post(
                 "https://g.api.mega.co.nz/cs",
                 params={"id": 0, "n": folder_id},
                 json=[{"a": "f", "c": 1, "r": 1}],
-                timeout=(10, 30),
+                timeout=(10, 300),
             )
             resp.raise_for_status()
             data = resp.json()
@@ -314,7 +300,7 @@ def _mega_get_folder_info_sync(url: str) -> tuple[str, list[dict]]:
 # ──────────────────────────────────────────────────────────────
 
 def _mega_download_one_file_sync(
-    folder_id: str, file_info: dict, dest_dir: str, use_proxy: bool = False
+    folder_id: str, file_info: dict, dest_dir: str,
 ) -> str:
     """
     Download a SINGLE file from a Mega folder using its pre-decrypted keys.
@@ -326,7 +312,7 @@ def _mega_download_one_file_sync(
     iv       = file_info["iv"]
 
     # Get download URL (through WARP proxy if enabled)
-    sess = _get_session(use_proxy=use_proxy)
+    sess = _get_proxied_session()
     dl_resp = sess.post(
         "https://g.api.mega.co.nz/cs",
         params={"id": 1, "n": folder_id},
@@ -512,7 +498,6 @@ def _generate_video_thumb(video_path: str) -> tuple[Optional[str], int, int, int
 
 async def _upload_file(
     user_id: int,
-    target_chat_id: int,  # Added target_chat_id
     filepath: Path,
     original_name: str,
     file_idx: int,
@@ -555,7 +540,7 @@ async def _upload_file(
         try:
             if file_type == "photo":
                 await app.send_photo(
-                    chat_id=target_chat_id,
+                    chat_id=user_id,
                     photo=str(part),
                     caption=caption,
                     progress=tracker.pyrogram_progress(),
@@ -566,7 +551,7 @@ async def _upload_file(
                 )
                 try:
                     await app.send_video(
-                        chat_id=target_chat_id,
+                        chat_id=user_id,
                         video=str(part),
                         thumb=thumb_path,
                         duration=vid_duration,
@@ -581,7 +566,7 @@ async def _upload_file(
                         Path(thumb_path).unlink(missing_ok=True)
             else:
                 await app.send_document(
-                    chat_id=target_chat_id,
+                    chat_id=user_id,
                     document=str(part),
                     file_name=send_name,
                     caption=caption,
@@ -602,7 +587,7 @@ async def _upload_file(
 
 async def process_folder(
     user_id: int,
-    target_chat_id: int,
+    chat_id: int,
     folder_id: str,
     file_infos: list[dict],
     start_from: int,
@@ -648,12 +633,8 @@ async def process_folder(
             )
 
             # ── Download with retry (3 attempts + bandwidth wait) ──
-            # ── Download with Smart Proxy Fallback ──
             filepath = None
-            MAX_DL_RETRIES = 15
-            force_proxy = False  # Start direct!
-            
-            for attempt in range(1, MAX_DL_RETRIES + 1):
+            for attempt in range(1, 4):
                 if cancel_event.is_set():
                     return
 
@@ -661,32 +642,45 @@ async def process_folder(
                 skip_event = user_skip.get(user_id)
                 if skip_event and skip_event.is_set():
                     skip_event.clear()
-                    await safe_edit(status_msg, f"⏭️ Skipped `{fname}`. Continuing…")
+                    await safe_edit(
+                        status_msg,
+                        f"⏭️ Skipped `{fname}` by user request. Continuing…"
+                    )
                     await asyncio.sleep(1)
                     break
 
                 try:
-                    # Pass the force_proxy flag to the download function
                     result = await asyncio.to_thread(
-                        _mega_download_one_file_sync, folder_id, finfo, str(user_dir), force_proxy
+                        _mega_download_one_file_sync, folder_id, finfo, str(user_dir),
                     )
                     filepath = Path(result)
-                    break  # success!
+                    break  # success
 
                 except BandwidthLimitError:
-                    # ── Mega 509: Enable Proxy Mode ──
-                    force_proxy = True  # All future attempts for this file will use proxies
-                    
-                    if CACHED_PROXIES:
-                        log.warning("Bandwidth limit on %s. Enabling Proxy Fallback…", fname)
+                    # ── Mega 509: try WARP IP rotation first ──
+                    if WARP_ENABLED:
+                        log.warning(
+                            "Bandwidth limit at file %d/%d (%s). Rotating WARP IP…",
+                            file_idx, total_files, fname,
+                        )
                         await safe_edit(
                             status_msg,
-                            f"🔄 **Mega Quota Hit!** Activating SOCKS5 Proxy evasion…\n"
-                            f"📍 File: `{fname}`"
+                            f"🔄 **Bandwidth limit hit!** Rotating IP via WARP…\n"
+                            f"📍 File **{file_idx}/{total_files}**: `{fname}`"
                         )
-                        await asyncio.sleep(1)
-                        continue
-                        # Because of how the loop works, 'continue' will automatically call _get_proxied_session() again, which grabs a random new proxy!
+                        rotated = await asyncio.to_thread(_rotate_warp_ip)
+                        if rotated:
+                            await safe_edit(
+                                status_msg,
+                                f"✅ **New IP obtained!** Retrying `{fname}`…"
+                            )
+                            await asyncio.sleep(2)
+                            continue  # retry with new IP
+                        else:
+                            await safe_edit(
+                                status_msg,
+                                f"⚠️ WARP rotation failed. Falling back to 10-min wait…"
+                            )
 
                     # ── Fallback: wait 10 minutes ──
                     wait_minutes = 10
@@ -767,7 +761,7 @@ async def process_folder(
 
             # Upload → delete
             ok = await _upload_file(
-                user_id, target_chat_id, filepath, fname, file_idx, total_files,
+                user_id, filepath, fname, file_idx, total_files,
                 status_msg, cancel_event,
             )
             await cleanup_path(filepath)
@@ -802,7 +796,7 @@ async def process_folder(
 
 async def process_single_file(
     user_id: int,
-    target_chat_id: int,
+    chat_id: int,
     link: str,
     status_msg: Message,
     cancel_event: asyncio.Event,
@@ -826,7 +820,7 @@ async def process_single_file(
         log.info("Downloaded: %s (%s)", original_name, human_size(file_size))
 
         ok = await _upload_file(
-            user_id, target_chat_id, filepath, original_name, 1, 1,
+            user_id, filepath, original_name, 1, 1,
             status_msg, cancel_event,
         )
         if ok and not cancel_event.is_set():
@@ -865,20 +859,18 @@ async def user_worker(user_id: int) -> None:
                     f"⏳ **Starting folder download…**\n"
                     f"📂 {total} files, starting from #{start_from}"
                 )
-                target_chat_id = job.get("target_chat_id", user_id)
                 async with global_semaphore:
                     await process_folder(
-                        user_id, target_chat_id, folder_id, file_infos,
+                        user_id, user_id, folder_id, file_infos,
                         start_from, status_msg, cancel_event,
                     )
             else:
                 link = job["link"]
                 user_status[user_id] = f"File: {link[:60]}…"
                 status_msg = await app.send_message(user_id, "⏳ **Starting…**")
-                target_chat_id = job.get("target_chat_id", user_id)
                 async with global_semaphore:
                     await process_single_file(
-                        user_id, target_chat_id, link, status_msg, cancel_event,
+                        user_id, user_id, link, status_msg, cancel_event,
                     )
         except Exception as exc:
             log.exception("Worker error for user %d: %s", user_id, exc)
@@ -978,117 +970,15 @@ async def cmd_status(_, msg: Message):
 
 
 # ──────────────────────────────────────────────────────────────
-#  MEGA LINK DETECTOR & DESTINATION HANDLER
+#  MEGA LINK DETECTOR
 # ──────────────────────────────────────────────────────────────
 
-def ask_for_destination(chat_id: int, text: str, job_dict: dict):
-    # Ask the user where they want to send the files using an inline keyboard
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Send to DM 👤", callback_data="dest_dm"),
-            InlineKeyboardButton("Send to Channel 📢", callback_data="dest_channel")
-        ]
-    ])
-    return app.send_message(
-        chat_id=chat_id,
-        text=f"{text}\n\n**Where do you want to send the file(s)?**",
-        reply_markup=keyboard
-    )
-
-@app.on_callback_query(filters.regex(r"^dest_"))
-async def dest_callback(_, query: CallbackQuery):
-    user_id = query.from_user.id
-    job = destination_pending.get(user_id)
-    
-    if not job:
-        await query.answer("This request has expired or was already processed.", show_alert=True)
-        return
-
-    dest_type = query.data.split("_")[1]
-    
-    if dest_type == "dm":
-        # Send to DM: Immediately queue the job
-        destination_pending.pop(user_id, None)
-        job["target_chat_id"] = user_id
-        q = ensure_worker(user_id)
-        
-        await query.message.edit_text("✅ **Sending to DM.** Queued successfully!")
-        
-        position = q.qsize() + 1
-        await q.put(job)
-        
-        if job["type"] == "file" and position > 1:
-            try:
-                await app.send_message(
-                    user_id,
-                    f"📋 **Queued** (position #{position}): `{job['link'][:80]}`",
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                pass
-
-    elif dest_type == "channel":
-        # Ask for Channel ID
-        destination_pending.pop(user_id, None)
-        channel_id_pending[user_id] = job
-        
-        await query.message.edit_text(
-            "📢 **Send to Channel selected.**\n\n"
-            "Please send the **Channel ID** (e.g. `-100123456789`) or forward a message from the channel.\n\n"
-            "_(Make sure the bot is an Admin in the channel first!)_"
-        )
-
 @app.on_message(filters.text & ~filters.command(["start", "cancel", "status", "skip"]))
-async def handle_text_messages(_, msg: Message):
+async def detect_mega_link(_, msg: Message):
     if not msg.text:
         return
 
     user_id = msg.from_user.id
-
-    # ── Check if user is replying with a Channel ID ──
-    if user_id in channel_id_pending:
-        text = msg.text.strip()
-        
-        # Try to parse as integer or username
-        target_chat = None
-        try:
-            if text.startswith("-100") and text[4:].isdigit():
-                target_chat = int(text)
-            elif text.startswith("@"):
-                target_chat = text
-            else:
-                target_chat = text # might be a username without @
-                
-            # Quick check if bot can access the channel
-            await app.get_chat(target_chat)
-            
-            job = channel_id_pending.pop(user_id)
-            job["target_chat_id"] = target_chat
-            
-            await msg.reply(f"✅ **Channel confirmed!** Queuing download...")
-            
-            q = ensure_worker(user_id)
-            position = q.qsize() + 1
-            await q.put(job)
-            
-            if job["type"] == "file" and position > 1:
-                try:
-                    await app.send_message(
-                        user_id,
-                        f"📋 **Queued** (position #{position}): `{job['link'][:80]}`",
-                        disable_web_page_preview=True,
-                    )
-                except Exception:
-                    pass
-            return
-                
-        except (PeerIdInvalid, ChannelInvalid, BadRequest, ValueError) as e:
-            await msg.reply(
-                f"❌ **Invalid Channel ID or the bot is not an admin there.**\n"
-                f"Error: `{e}`\n\n"
-                f"Please try again or send `/cancel`."
-            )
-            return
 
     # ── Check if user is replying with a start-from number ──
     if user_id in folder_pending:
@@ -1111,15 +1001,14 @@ async def handle_text_messages(_, msg: Message):
                 f"✅ Starting download from file **#{start_from}** out of **{total}**."
             )
 
-            job = {
+            q = ensure_worker(user_id)
+            await q.put({
                 "type": "folder",
                 "link": link,
                 "folder_id": folder_id,
                 "file_infos": file_infos,
                 "start_from": start_from,
-            }
-            destination_pending[user_id] = job
-            await ask_for_destination(msg.chat.id, f"✅ Starting download from file **#{start_from}** out of **{total}**.", job)
+            })
             return
         else:
             # Not a number — clear pending and fall through to link detection
@@ -1170,13 +1059,22 @@ async def handle_text_messages(_, msg: Message):
             folder_pending[user_id] = (msg, link, msg.chat.id, folder_id, file_infos)
 
         else:
-            # ── SINGLE FILE: Ask for destination ──
-            job = {
+            # ── SINGLE FILE: queue immediately ──
+            q = ensure_worker(user_id)
+            position = q.qsize() + 1
+            await q.put({
                 "type": "file",
                 "link": link,
-            }
-            destination_pending[user_id] = job
-            await ask_for_destination(msg.chat.id, "✅ **File Link Detected!**", job)
+            })
+            if position > 1:
+                try:
+                    await app.send_message(
+                        user_id,
+                        f"📋 **Queued** (position #{position}): `{link[:80]}`",
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    pass
 
 
 # ──────────────────────────────────────────────────────────────
