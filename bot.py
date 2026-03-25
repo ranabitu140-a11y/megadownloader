@@ -87,6 +87,11 @@ log = logging.getLogger("mega-bot")
 
 app = Client("mega_bot", api_id=APP_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+if WARP_ENABLED:
+    log.info("WARP proxy enabled: %s", WARP_PROXY)
+else:
+    log.info("WARP proxy disabled; Mega requests will use the host network")
+
 # ──────────────────────────────────────────────────────────────
 #  GLOBAL STATE
 # ──────────────────────────────────────────────────────────────

@@ -14,5 +14,7 @@ warp-cli --accept-tos connect
 # Wait 2 seconds for the connection to establish
 sleep 2
 
+export WARP_PROXY="${WARP_PROXY:-socks5h://127.0.0.1:40000}"
+
 echo "WARP Connected! Starting Telegram Bot..."
 python bot.py
