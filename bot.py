@@ -41,8 +41,8 @@ from mega.crypto import (
 from Crypto.Cipher import AES
 from Crypto.Util import Counter
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from pyrogram.errors import FloodWait, BadRequest, PeerIdInvalid, ChannelInvalid
+from pyrogram.types import Message
+from pyrogram.errors import FloodWait, BadRequest
 
 # ──────────────────────────────────────────────────────────────
 #  CONFIGURATION
@@ -89,12 +89,6 @@ global_semaphore = asyncio.Semaphore(MAX_CONCURRENT_USERS)
 
 # Conversation state: user_id → (msg, link, chat_id, folder_id, file_infos)
 folder_pending: dict[int, tuple] = {}
-
-# Destination state pending: user_id → JobDict (used to hold job details until a destination is selected)
-destination_pending: dict[int, dict] = {}
-
-# Channel ID state pending: user_id → JobDict
-channel_id_pending: dict[int, dict] = {}
 
 
 class BandwidthLimitError(Exception):
@@ -504,7 +498,6 @@ def _generate_video_thumb(video_path: str) -> tuple[Optional[str], int, int, int
 
 async def _upload_file(
     user_id: int,
-    target_chat_id: int,  # Added target_chat_id
     filepath: Path,
     original_name: str,
     file_idx: int,
@@ -547,7 +540,7 @@ async def _upload_file(
         try:
             if file_type == "photo":
                 await app.send_photo(
-                    chat_id=target_chat_id,
+                    chat_id=user_id,
                     photo=str(part),
                     caption=caption,
                     progress=tracker.pyrogram_progress(),
@@ -558,7 +551,7 @@ async def _upload_file(
                 )
                 try:
                     await app.send_video(
-                        chat_id=target_chat_id,
+                        chat_id=user_id,
                         video=str(part),
                         thumb=thumb_path,
                         duration=vid_duration,
@@ -573,7 +566,7 @@ async def _upload_file(
                         Path(thumb_path).unlink(missing_ok=True)
             else:
                 await app.send_document(
-                    chat_id=target_chat_id,
+                    chat_id=user_id,
                     document=str(part),
                     file_name=send_name,
                     caption=caption,
@@ -594,7 +587,7 @@ async def _upload_file(
 
 async def process_folder(
     user_id: int,
-    target_chat_id: int,
+    chat_id: int,
     folder_id: str,
     file_infos: list[dict],
     start_from: int,
@@ -768,7 +761,7 @@ async def process_folder(
 
             # Upload → delete
             ok = await _upload_file(
-                user_id, target_chat_id, filepath, fname, file_idx, total_files,
+                user_id, filepath, fname, file_idx, total_files,
                 status_msg, cancel_event,
             )
             await cleanup_path(filepath)
@@ -803,7 +796,7 @@ async def process_folder(
 
 async def process_single_file(
     user_id: int,
-    target_chat_id: int,
+    chat_id: int,
     link: str,
     status_msg: Message,
     cancel_event: asyncio.Event,
@@ -827,7 +820,7 @@ async def process_single_file(
         log.info("Downloaded: %s (%s)", original_name, human_size(file_size))
 
         ok = await _upload_file(
-            user_id, target_chat_id, filepath, original_name, 1, 1,
+            user_id, filepath, original_name, 1, 1,
             status_msg, cancel_event,
         )
         if ok and not cancel_event.is_set():
@@ -866,20 +859,18 @@ async def user_worker(user_id: int) -> None:
                     f"⏳ **Starting folder download…**\n"
                     f"📂 {total} files, starting from #{start_from}"
                 )
-                target_chat_id = job.get("target_chat_id", user_id)
                 async with global_semaphore:
                     await process_folder(
-                        user_id, target_chat_id, folder_id, file_infos,
+                        user_id, user_id, folder_id, file_infos,
                         start_from, status_msg, cancel_event,
                     )
             else:
                 link = job["link"]
                 user_status[user_id] = f"File: {link[:60]}…"
                 status_msg = await app.send_message(user_id, "⏳ **Starting…**")
-                target_chat_id = job.get("target_chat_id", user_id)
                 async with global_semaphore:
                     await process_single_file(
-                        user_id, target_chat_id, link, status_msg, cancel_event,
+                        user_id, user_id, link, status_msg, cancel_event,
                     )
         except Exception as exc:
             log.exception("Worker error for user %d: %s", user_id, exc)
@@ -979,117 +970,15 @@ async def cmd_status(_, msg: Message):
 
 
 # ──────────────────────────────────────────────────────────────
-#  MEGA LINK DETECTOR & DESTINATION HANDLER
+#  MEGA LINK DETECTOR
 # ──────────────────────────────────────────────────────────────
 
-def ask_for_destination(chat_id: int, text: str, job_dict: dict):
-    # Ask the user where they want to send the files using an inline keyboard
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Send to DM 👤", callback_data="dest_dm"),
-            InlineKeyboardButton("Send to Channel 📢", callback_data="dest_channel")
-        ]
-    ])
-    return app.send_message(
-        chat_id=chat_id,
-        text=f"{text}\n\n**Where do you want to send the file(s)?**",
-        reply_markup=keyboard
-    )
-
-@app.on_callback_query(filters.regex(r"^dest_"))
-async def dest_callback(_, query: CallbackQuery):
-    user_id = query.from_user.id
-    job = destination_pending.get(user_id)
-    
-    if not job:
-        await query.answer("This request has expired or was already processed.", show_alert=True)
-        return
-
-    dest_type = query.data.split("_")[1]
-    
-    if dest_type == "dm":
-        # Send to DM: Immediately queue the job
-        destination_pending.pop(user_id, None)
-        job["target_chat_id"] = user_id
-        q = ensure_worker(user_id)
-        
-        await query.message.edit_text("✅ **Sending to DM.** Queued successfully!")
-        
-        position = q.qsize() + 1
-        await q.put(job)
-        
-        if job["type"] == "file" and position > 1:
-            try:
-                await app.send_message(
-                    user_id,
-                    f"📋 **Queued** (position #{position}): `{job['link'][:80]}`",
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                pass
-
-    elif dest_type == "channel":
-        # Ask for Channel ID
-        destination_pending.pop(user_id, None)
-        channel_id_pending[user_id] = job
-        
-        await query.message.edit_text(
-            "📢 **Send to Channel selected.**\n\n"
-            "Please send the **Channel ID** (e.g. `-100123456789`) or forward a message from the channel.\n\n"
-            "_(Make sure the bot is an Admin in the channel first!)_"
-        )
-
 @app.on_message(filters.text & ~filters.command(["start", "cancel", "status", "skip"]))
-async def handle_text_messages(_, msg: Message):
+async def detect_mega_link(_, msg: Message):
     if not msg.text:
         return
 
     user_id = msg.from_user.id
-
-    # ── Check if user is replying with a Channel ID ──
-    if user_id in channel_id_pending:
-        text = msg.text.strip()
-        
-        # Try to parse as integer or username
-        target_chat = None
-        try:
-            if text.startswith("-100") and text[4:].isdigit():
-                target_chat = int(text)
-            elif text.startswith("@"):
-                target_chat = text
-            else:
-                target_chat = text # might be a username without @
-                
-            # Quick check if bot can access the channel
-            await app.get_chat(target_chat)
-            
-            job = channel_id_pending.pop(user_id)
-            job["target_chat_id"] = target_chat
-            
-            await msg.reply(f"✅ **Channel confirmed!** Queuing download...")
-            
-            q = ensure_worker(user_id)
-            position = q.qsize() + 1
-            await q.put(job)
-            
-            if job["type"] == "file" and position > 1:
-                try:
-                    await app.send_message(
-                        user_id,
-                        f"📋 **Queued** (position #{position}): `{job['link'][:80]}`",
-                        disable_web_page_preview=True,
-                    )
-                except Exception:
-                    pass
-            return
-                
-        except (PeerIdInvalid, ChannelInvalid, BadRequest, ValueError) as e:
-            await msg.reply(
-                f"❌ **Invalid Channel ID or the bot is not an admin there.**\n"
-                f"Error: `{e}`\n\n"
-                f"Please try again or send `/cancel`."
-            )
-            return
 
     # ── Check if user is replying with a start-from number ──
     if user_id in folder_pending:
@@ -1112,15 +1001,14 @@ async def handle_text_messages(_, msg: Message):
                 f"✅ Starting download from file **#{start_from}** out of **{total}**."
             )
 
-            job = {
+            q = ensure_worker(user_id)
+            await q.put({
                 "type": "folder",
                 "link": link,
                 "folder_id": folder_id,
                 "file_infos": file_infos,
                 "start_from": start_from,
-            }
-            destination_pending[user_id] = job
-            await ask_for_destination(msg.chat.id, f"✅ Starting download from file **#{start_from}** out of **{total}**.", job)
+            })
             return
         else:
             # Not a number — clear pending and fall through to link detection
@@ -1171,13 +1059,22 @@ async def handle_text_messages(_, msg: Message):
             folder_pending[user_id] = (msg, link, msg.chat.id, folder_id, file_infos)
 
         else:
-            # ── SINGLE FILE: Ask for destination ──
-            job = {
+            # ── SINGLE FILE: queue immediately ──
+            q = ensure_worker(user_id)
+            position = q.qsize() + 1
+            await q.put({
                 "type": "file",
                 "link": link,
-            }
-            destination_pending[user_id] = job
-            await ask_for_destination(msg.chat.id, "✅ **File Link Detected!**", job)
+            })
+            if position > 1:
+                try:
+                    await app.send_message(
+                        user_id,
+                        f"📋 **Queued** (position #{position}): `{link[:80]}`",
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    pass
 
 
 # ──────────────────────────────────────────────────────────────
