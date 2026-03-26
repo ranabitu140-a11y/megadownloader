@@ -11,7 +11,6 @@ for folder downloads with AES decryption.
 
 import os
 import re
-import json
 import math
 import time
 import shutil
@@ -20,7 +19,6 @@ import logging
 from pathlib import Path
 from typing import Optional
 import subprocess
-from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -43,8 +41,8 @@ from mega.crypto import (
 from Crypto.Cipher import AES
 from Crypto.Util import Counter
 from pyrogram import Client, filters
-from pyrogram.types import Message
-from pyrogram.errors import FloodWait, BadRequest
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.errors import FloodWait, BadRequest, PeerIdInvalid, ChannelInvalid
 
 # ──────────────────────────────────────────────────────────────
 #  CONFIGURATION
@@ -61,23 +59,14 @@ CHUNK_SIZE = 2 * 1024 * 1024 * 1024 - 10 * 1024 * 1024   # ~1.99 GB
 SPLIT_READ_BUF = 8 * 1024 * 1024          # 8 MB I/O buffer
 PROGRESS_EDIT_INTERVAL = 3                 # seconds between edits
 MAX_CONCURRENT_USERS = 5
-MEGA_API_RETRIES = 5
 
 # ── WARP Proxy (set in .env to enable) ──
 WARP_PROXY = os.environ.get("WARP_PROXY", "").strip()  # e.g. socks5h://127.0.0.1:40000
 WARP_ENABLED = bool(WARP_PROXY)
 
 MEGA_LINK_RE = re.compile(
-    r"https?://(?:www\.)?(?:mega\.nz|mega\.co\.nz)/(?:file|folder|#|#!|#F!)[^\s]+",
-    re.IGNORECASE,
+    r"https?://mega\.nz/(?:file|folder|#|#!|#F!)[^\s]+"
 )
-
-MEGA_DOMAINS = {
-    "mega.nz",
-    "www.mega.nz",
-    "mega.co.nz",
-    "www.mega.co.nz",
-}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,11 +75,6 @@ logging.basicConfig(
 log = logging.getLogger("mega-bot")
 
 app = Client("mega_bot", api_id=APP_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-if WARP_ENABLED:
-    log.info("WARP proxy enabled: %s", WARP_PROXY)
-else:
-    log.info("WARP proxy disabled; Mega requests will use the host network")
 
 # ──────────────────────────────────────────────────────────────
 #  GLOBAL STATE
@@ -105,6 +89,12 @@ global_semaphore = asyncio.Semaphore(MAX_CONCURRENT_USERS)
 
 # Conversation state: user_id → (msg, link, chat_id, folder_id, file_infos)
 folder_pending: dict[int, tuple] = {}
+
+# Destination state pending: user_id → JobDict (used to hold job details until a destination is selected)
+destination_pending: dict[int, dict] = {}
+
+# Channel ID state pending: user_id → JobDict
+channel_id_pending: dict[int, dict] = {}
 
 
 class BandwidthLimitError(Exception):
@@ -187,72 +177,29 @@ async def cleanup_path(path: Path) -> None:
 
 def is_mega_folder(url: str) -> bool:
     """Check if a Mega URL points to a folder."""
-    try:
-        kind, _, _ = parse_mega_link(url)
-        return kind == "folder"
-    except ValueError:
-        return False
-
-
-def normalize_mega_url(url: str) -> str:
-    """Trim punctuation/wrappers that often cling to pasted Mega URLs."""
-    return url.strip().strip("<>[](){}\"'`,.;")
-
-
-def parse_mega_link(url: str) -> tuple[str, str, str]:
-    """
-    Parse a public Mega link and return (kind, handle, key).
-
-    Supports both old fragment-based links and current path-based links,
-    plus common Mega domains such as mega.co.nz and www.mega.nz.
-    """
-    normalized = normalize_mega_url(url)
-    parsed = urlsplit(normalized)
-    if parsed.scheme not in {"http", "https"}:
-        raise ValueError(f"Unsupported Mega URL scheme: {url}")
-
-    host = parsed.netloc.lower()
-    if host not in MEGA_DOMAINS:
-        raise ValueError(f"Unsupported Mega host: {url}")
-
-    path_parts = [part for part in parsed.path.split("/") if part]
-    fragment = parsed.fragment
-
-    if len(path_parts) >= 2 and path_parts[0] in {"file", "folder"}:
-        kind = path_parts[0]
-        handle = path_parts[1]
-        key = fragment.split("/", 1)[0]
-        if handle and key:
-            return kind, handle, key
-
-    if fragment.startswith("F!"):
-        parts = fragment[2:].split("!", 2)
-        if len(parts) >= 2 and parts[0] and parts[1]:
-            return "folder", parts[0], parts[1]
-
-    if fragment.startswith("!"):
-        parts = fragment[1:].split("!", 1)
-        if len(parts) == 2 and parts[0] and parts[1]:
-            return "file", parts[0], parts[1]
-
-    raise ValueError(f"Cannot parse Mega URL: {url}")
+    return "/folder/" in url or "/#F!" in url
 
 
 def parse_mega_folder_url(url: str) -> tuple[str, str]:
     """Extract (folder_id, folder_key_b64) from a folder URL."""
-    kind, folder_id, folder_key_b64 = parse_mega_link(url)
-    if kind != "folder":
-        raise ValueError(f"Not a Mega folder URL: {url}")
-    return folder_id, folder_key_b64
+    # New format: mega.nz/folder/ID#KEY
+    m = re.match(r"https?://mega\.nz/folder/([^#]+)#(.+)", url)
+    if m:
+        return m.group(1), m.group(2)
+    # Old format: mega.nz/#F!ID!KEY
+    m = re.match(r"https?://mega\.nz/#F!([^!]+)!(.+)", url)
+    if m:
+        return m.group(1), m.group(2)
+    raise ValueError(f"Cannot parse Mega folder URL: {url}")
 
 
 def convert_mega_file_url(url: str) -> str:
     """Convert new-format file URL to old format for mega.py compatibility."""
     # mega.nz/file/ID#KEY → mega.nz/#!ID!KEY
-    kind, file_id, file_key_b64 = parse_mega_link(url)
-    if kind != "file":
-        raise ValueError(f"Not a Mega file URL: {url}")
-    return f"https://mega.nz/#!{file_id}!{file_key_b64}"
+    m = re.match(r"https?://mega\.nz/file/([^#]+)#(.+)", url)
+    if m:
+        return f"https://mega.nz/#!{m.group(1)}!{m.group(2)}"
+    return url  # already old format or something else
 
 
 # ──────────────────────────────────────────────────────────────
@@ -285,49 +232,25 @@ def _mega_get_folder_info_sync(url: str) -> tuple[str, list[dict]]:
 
     # Get folder listing with retry
     data = None
-    for attempt in range(1, MEGA_API_RETRIES + 1):
+    for attempt in range(1, 4):
         try:
             sess = _get_proxied_session()
             resp = sess.post(
                 "https://g.api.mega.co.nz/cs",
                 params={"id": 0, "n": folder_id},
-                data=json.dumps([{"a": "f", "c": 1, "r": 1}]),
-                headers={"Content-Type": "application/json"},
+                json=[{"a": "f", "c": 1, "r": 1}],
                 timeout=(10, 300),
             )
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, int) and data < 0:
-                if data == -3:
-                    raise RuntimeError("Mega API error code: -3")
                 raise RuntimeError(f"Mega API error code: {data}")
-            if isinstance(data, list) and data:
-                data = data[0]
-            if isinstance(data, int) and data < 0:
-                if data == -3:
-                    raise RuntimeError("Mega API error code: -3")
-                raise RuntimeError(f"Mega API error code: {data}")
-            if not isinstance(data, dict):
-                raise RuntimeError(f"Unexpected Mega API response: {data!r}")
+            data = data[0]
             break
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            log.warning("Folder listing attempt %d/%d failed: %s", attempt, MEGA_API_RETRIES, e)
-            if attempt == MEGA_API_RETRIES:
-                raise RuntimeError(f"Failed to fetch folder after {MEGA_API_RETRIES} attempts: {e}") from e
-            import time as _time
-            _time.sleep(3 * attempt)
-        except RuntimeError as e:
-            if "Mega API error code: -3" not in str(e):
-                raise
-            log.warning(
-                "Folder listing attempt %d/%d got transient Mega error -3",
-                attempt,
-                MEGA_API_RETRIES,
-            )
-            if attempt == MEGA_API_RETRIES:
-                raise RuntimeError(
-                    f"Failed to fetch folder after {MEGA_API_RETRIES} attempts: {e}"
-                ) from e
+            log.warning("Folder listing attempt %d/3 failed: %s", attempt, e)
+            if attempt == 3:
+                raise RuntimeError(f"Failed to fetch folder after 3 attempts: {e}") from e
             import time as _time
             _time.sleep(3 * attempt)
 
@@ -395,39 +318,22 @@ def _mega_download_one_file_sync(
     iv       = file_info["iv"]
 
     # Get download URL (through WARP proxy if enabled)
-    dl_data = None
     sess = _get_proxied_session()
-    for attempt in range(1, MEGA_API_RETRIES + 1):
-        dl_resp = sess.post(
-            "https://g.api.mega.co.nz/cs",
-            params={"id": 1, "n": folder_id},
-            data=json.dumps([{"a": "g", "g": 1, "n": handle}]),
-            headers={"Content-Type": "application/json"},
-            timeout=(10, 120),
-        )
-        if dl_resp.status_code == 509:
-            raise BandwidthLimitError(f"Mega bandwidth limit exceeded for {filename}")
-        dl_resp.raise_for_status()
-        dl_data = dl_resp.json()
-        if isinstance(dl_data, list) and dl_data:
-            dl_data = dl_data[0]
+    dl_resp = sess.post(
+        "https://g.api.mega.co.nz/cs",
+        params={"id": 1, "n": folder_id},
+        json=[{"a": "g", "g": 1, "n": handle}],
+        timeout=(10, 120),
+    )
+    if dl_resp.status_code == 509:
+        raise BandwidthLimitError(f"Mega bandwidth limit exceeded for {filename}")
+    dl_resp.raise_for_status()
+    dl_data = dl_resp.json()[0]
 
-        if isinstance(dl_data, int) and dl_data < 0:
-            if dl_data == -509:
-                raise BandwidthLimitError(f"Mega bandwidth limit exceeded for {filename}")
-            if dl_data == -3 and attempt < MEGA_API_RETRIES:
-                log.warning(
-                    "Download-url attempt %d/%d got transient Mega error -3 for %s",
-                    attempt,
-                    MEGA_API_RETRIES,
-                    filename,
-                )
-                time.sleep(2 * attempt)
-                continue
-            raise RuntimeError(f"Mega API error {dl_data} for {filename}")
-        if not isinstance(dl_data, dict):
-            raise RuntimeError(f"Unexpected Mega API response for {filename}: {dl_data!r}")
-        break
+    if isinstance(dl_data, int) and dl_data < 0:
+        if dl_data == -509:
+            raise BandwidthLimitError(f"Mega bandwidth limit exceeded for {filename}")
+        raise RuntimeError(f"Mega API error {dl_data} for {filename}")
 
     dl_url    = dl_data["g"]
     file_size = dl_data["s"]
@@ -598,6 +504,7 @@ def _generate_video_thumb(video_path: str) -> tuple[Optional[str], int, int, int
 
 async def _upload_file(
     user_id: int,
+    target_chat_id: int,  # Added target_chat_id
     filepath: Path,
     original_name: str,
     file_idx: int,
@@ -640,7 +547,7 @@ async def _upload_file(
         try:
             if file_type == "photo":
                 await app.send_photo(
-                    chat_id=user_id,
+                    chat_id=target_chat_id,
                     photo=str(part),
                     caption=caption,
                     progress=tracker.pyrogram_progress(),
@@ -651,7 +558,7 @@ async def _upload_file(
                 )
                 try:
                     await app.send_video(
-                        chat_id=user_id,
+                        chat_id=target_chat_id,
                         video=str(part),
                         thumb=thumb_path,
                         duration=vid_duration,
@@ -666,7 +573,7 @@ async def _upload_file(
                         Path(thumb_path).unlink(missing_ok=True)
             else:
                 await app.send_document(
-                    chat_id=user_id,
+                    chat_id=target_chat_id,
                     document=str(part),
                     file_name=send_name,
                     caption=caption,
@@ -687,7 +594,7 @@ async def _upload_file(
 
 async def process_folder(
     user_id: int,
-    chat_id: int,
+    target_chat_id: int,
     folder_id: str,
     file_infos: list[dict],
     start_from: int,
@@ -861,7 +768,7 @@ async def process_folder(
 
             # Upload → delete
             ok = await _upload_file(
-                user_id, filepath, fname, file_idx, total_files,
+                user_id, target_chat_id, filepath, fname, file_idx, total_files,
                 status_msg, cancel_event,
             )
             await cleanup_path(filepath)
@@ -896,7 +803,7 @@ async def process_folder(
 
 async def process_single_file(
     user_id: int,
-    chat_id: int,
+    target_chat_id: int,
     link: str,
     status_msg: Message,
     cancel_event: asyncio.Event,
@@ -920,7 +827,7 @@ async def process_single_file(
         log.info("Downloaded: %s (%s)", original_name, human_size(file_size))
 
         ok = await _upload_file(
-            user_id, filepath, original_name, 1, 1,
+            user_id, target_chat_id, filepath, original_name, 1, 1,
             status_msg, cancel_event,
         )
         if ok and not cancel_event.is_set():
@@ -959,18 +866,20 @@ async def user_worker(user_id: int) -> None:
                     f"⏳ **Starting folder download…**\n"
                     f"📂 {total} files, starting from #{start_from}"
                 )
+                target_chat_id = job.get("target_chat_id", user_id)
                 async with global_semaphore:
                     await process_folder(
-                        user_id, user_id, folder_id, file_infos,
+                        user_id, target_chat_id, folder_id, file_infos,
                         start_from, status_msg, cancel_event,
                     )
             else:
                 link = job["link"]
                 user_status[user_id] = f"File: {link[:60]}…"
                 status_msg = await app.send_message(user_id, "⏳ **Starting…**")
+                target_chat_id = job.get("target_chat_id", user_id)
                 async with global_semaphore:
                     await process_single_file(
-                        user_id, user_id, link, status_msg, cancel_event,
+                        user_id, target_chat_id, link, status_msg, cancel_event,
                     )
         except Exception as exc:
             log.exception("Worker error for user %d: %s", user_id, exc)
@@ -1070,15 +979,117 @@ async def cmd_status(_, msg: Message):
 
 
 # ──────────────────────────────────────────────────────────────
-#  MEGA LINK DETECTOR
+#  MEGA LINK DETECTOR & DESTINATION HANDLER
 # ──────────────────────────────────────────────────────────────
 
+def ask_for_destination(chat_id: int, text: str, job_dict: dict):
+    # Ask the user where they want to send the files using an inline keyboard
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Send to DM 👤", callback_data="dest_dm"),
+            InlineKeyboardButton("Send to Channel 📢", callback_data="dest_channel")
+        ]
+    ])
+    return app.send_message(
+        chat_id=chat_id,
+        text=f"{text}\n\n**Where do you want to send the file(s)?**",
+        reply_markup=keyboard
+    )
+
+@app.on_callback_query(filters.regex(r"^dest_"))
+async def dest_callback(_, query: CallbackQuery):
+    user_id = query.from_user.id
+    job = destination_pending.get(user_id)
+    
+    if not job:
+        await query.answer("This request has expired or was already processed.", show_alert=True)
+        return
+
+    dest_type = query.data.split("_")[1]
+    
+    if dest_type == "dm":
+        # Send to DM: Immediately queue the job
+        destination_pending.pop(user_id, None)
+        job["target_chat_id"] = user_id
+        q = ensure_worker(user_id)
+        
+        await query.message.edit_text("✅ **Sending to DM.** Queued successfully!")
+        
+        position = q.qsize() + 1
+        await q.put(job)
+        
+        if job["type"] == "file" and position > 1:
+            try:
+                await app.send_message(
+                    user_id,
+                    f"📋 **Queued** (position #{position}): `{job['link'][:80]}`",
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+
+    elif dest_type == "channel":
+        # Ask for Channel ID
+        destination_pending.pop(user_id, None)
+        channel_id_pending[user_id] = job
+        
+        await query.message.edit_text(
+            "📢 **Send to Channel selected.**\n\n"
+            "Please send the **Channel ID** (e.g. `-100123456789`) or forward a message from the channel.\n\n"
+            "_(Make sure the bot is an Admin in the channel first!)_"
+        )
+
 @app.on_message(filters.text & ~filters.command(["start", "cancel", "status", "skip"]))
-async def detect_mega_link(_, msg: Message):
+async def handle_text_messages(_, msg: Message):
     if not msg.text:
         return
 
     user_id = msg.from_user.id
+
+    # ── Check if user is replying with a Channel ID ──
+    if user_id in channel_id_pending:
+        text = msg.text.strip()
+        
+        # Try to parse as integer or username
+        target_chat = None
+        try:
+            if text.startswith("-100") and text[4:].isdigit():
+                target_chat = int(text)
+            elif text.startswith("@"):
+                target_chat = text
+            else:
+                target_chat = text # might be a username without @
+                
+            # Quick check if bot can access the channel
+            await app.get_chat(target_chat)
+            
+            job = channel_id_pending.pop(user_id)
+            job["target_chat_id"] = target_chat
+            
+            await msg.reply(f"✅ **Channel confirmed!** Queuing download...")
+            
+            q = ensure_worker(user_id)
+            position = q.qsize() + 1
+            await q.put(job)
+            
+            if job["type"] == "file" and position > 1:
+                try:
+                    await app.send_message(
+                        user_id,
+                        f"📋 **Queued** (position #{position}): `{job['link'][:80]}`",
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    pass
+            return
+                
+        except (PeerIdInvalid, ChannelInvalid, BadRequest, ValueError) as e:
+            await msg.reply(
+                f"❌ **Invalid Channel ID or the bot is not an admin there.**\n"
+                f"Error: `{e}`\n\n"
+                f"Please try again or send `/cancel`."
+            )
+            return
 
     # ── Check if user is replying with a start-from number ──
     if user_id in folder_pending:
@@ -1101,14 +1112,15 @@ async def detect_mega_link(_, msg: Message):
                 f"✅ Starting download from file **#{start_from}** out of **{total}**."
             )
 
-            q = ensure_worker(user_id)
-            await q.put({
+            job = {
                 "type": "folder",
                 "link": link,
                 "folder_id": folder_id,
                 "file_infos": file_infos,
                 "start_from": start_from,
-            })
+            }
+            destination_pending[user_id] = job
+            await ask_for_destination(msg.chat.id, f"✅ Starting download from file **#{start_from}** out of **{total}**.", job)
             return
         else:
             # Not a number — clear pending and fall through to link detection
@@ -1159,22 +1171,13 @@ async def detect_mega_link(_, msg: Message):
             folder_pending[user_id] = (msg, link, msg.chat.id, folder_id, file_infos)
 
         else:
-            # ── SINGLE FILE: queue immediately ──
-            q = ensure_worker(user_id)
-            position = q.qsize() + 1
-            await q.put({
+            # ── SINGLE FILE: Ask for destination ──
+            job = {
                 "type": "file",
                 "link": link,
-            })
-            if position > 1:
-                try:
-                    await app.send_message(
-                        user_id,
-                        f"📋 **Queued** (position #{position}): `{link[:80]}`",
-                        disable_web_page_preview=True,
-                    )
-                except Exception:
-                    pass
+            }
+            destination_pending[user_id] = job
+            await ask_for_destination(msg.chat.id, "✅ **File Link Detected!**", job)
 
 
 # ──────────────────────────────────────────────────────────────
