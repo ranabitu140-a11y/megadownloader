@@ -1,12 +1,16 @@
 #!/bin/bash
 
+# Start the system message bus (fixes the dbus warnings)
+mkdir -p /run/dbus
+dbus-daemon --system --fork
+
 echo "Starting Cloudflare WARP..."
 # Start the WARP background service manually
 warp-svc &
 # Give it 5 seconds to boot up
 sleep 5
 
-# Register, set proxy mode, define the port, and connect (Updated Syntax)
+# Register, set proxy mode, define the port, and connect
 warp-cli registration new
 warp-cli mode proxy
 warp-cli proxy port 40000
