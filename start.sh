@@ -6,10 +6,11 @@ warp-svc &
 # Give it 5 seconds to boot up
 sleep 5
 
-# Register, set proxy mode, and connect
-warp-cli --accept-tos registration new
-warp-cli --accept-tos mode proxy
-warp-cli --accept-tos connect
+# Register, set proxy mode, define the port, and connect (Updated Syntax)
+warp-cli registration new
+warp-cli mode proxy
+warp-cli proxy port 40000
+warp-cli connect
 
 # Wait 2 seconds for the connection to establish
 sleep 2
